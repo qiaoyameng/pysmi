@@ -57,6 +57,7 @@ This example showcases some of its features:
    /pysmi/corpus/site
    /pysmi/registry
    /pysmi/patches
+   /pysmi/displayhint
 
 .. _camel-case-deprecation:
 
@@ -303,4 +304,3 @@ them out individually:
 
    ``debug.setLogger()`` and ``debug.Debug()`` still work, but are
    deprecated in favour of ``debug.enableDebugLogging()``.
-

@@ -203,3 +203,19 @@ class PySmiWriterError(PySmiError):
     Raised when the destination cannot be created or written, or when a
     caller-supplied callback raises while receiving the output.
     """
+
+
+class PySmiDisplayHintError(PySmiError):
+    """A DISPLAY-HINT could not be compiled or a conversion failed.
+
+    Raised when a hint does not follow the RFC 2579 section 3.1 grammar, when
+    a value does not fit the hint or the constraints of the underlying type,
+    and when text is parsed that the hint cannot segment. Parsing is only
+    attempted for hints that segment unambiguously; anything else is refused
+    with the reason rather than guessed at.
+    """
+
+    #: Offset into the input text (or into the hint) the error concerns.
+    position: "int | None" = None
+    #: Index of the octet-format specification within the hint, if relevant.
+    segment: "int | None" = None
