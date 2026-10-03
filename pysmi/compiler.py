@@ -146,6 +146,51 @@ def revision_of(mibData: str) -> str | None:
     return normalise_revision(match[1])
 
 
+#: Separator between a source namespace and the module name it qualifies, as
+#: in ``vendor-a@VENDOR-MIB``. An SMI module name cannot contain it (RFC 2578
+#: Section 3.1 allows letters, digits and hyphens), so a qualified name splits
+#: back apart without ambiguity, and the namespace is registered under a name
+#: that cannot contain it either.
+NAMESPACE_SEPARATOR: Final = "@"
+
+#: What a namespace may be called. Anything file-name-safe that cannot be
+#: confused with part of a module name: the qualified form is written as the
+#: compiled module's file name, and it is the ``@`` above that has to stay
+#: exclusive to the separator.
+_NAMESPACE_NAME: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
+
+
+def qualify_module_name(namespace: str, mibname: str) -> str:
+    """The name *mibname* compiles to when its source belongs to *namespace*.
+
+    Args:
+        namespace: the namespace a group of sources was registered under
+        mibname: the module's own name, as its ASN.1 declares it
+
+    Returns:
+        The qualified module name, ``namespace@mibname``.
+    """
+    return f"{namespace}{NAMESPACE_SEPARATOR}{mibname}"
+
+
+def split_module_name(mibname: str) -> "tuple[str | None, str]":
+    """Take a possibly qualified module name apart.
+
+    Args:
+        mibname: a module name, qualified or not
+
+    Returns:
+        ``(namespace, plain name)`` for a qualified name, ``(None, mibname)``
+        for a plain one.
+    """
+    namespace, separator, plain = mibname.partition(NAMESPACE_SEPARATOR)
+
+    if separator:
+        return namespace, plain
+
+    return None, mibname
+
+
 @deprecated_camel_case
 class MibStatus(str):
     """Indicate MIB transformation result.
@@ -184,6 +229,11 @@ class MibStatus(str):
     file: str
     #: Name the MIB was found under, when it differs from its module name.
     alias: str
+    #: Namespace the module's source was registered under, by
+    #: :py:meth:`MibCompiler.add_namespaced_sources`. Empty for a module
+    #: compiled from a shared source. The module name the status is keyed by
+    #: is already qualified with it; this carries it as data.
+    namespace: str
     #: MODULE-IDENTITY OID.
     oid: str
     #: All OIDs defined in the module.
@@ -351,6 +401,11 @@ class MibCompiler:
         self._priority_sources: list[AbstractReader] = []
         self._searchers: list[AbstractSearcher] = []
         self._borrowers: list[AbstractBorrower] = []
+        #: The namespace each namespaced source was registered under, by
+        #: :py:meth:`add_namespaced_sources`. A source absent from this map is
+        #: shared: its modules compile under their own names and any namespace
+        #: may resolve a dependency against them.
+        self._sourceNamespaces: dict[AbstractReader, str] = {}
 
         self._preferConfiguredSources = preferConfiguredSources
         #: Where parse trees are kept between :py:meth:`compile` calls.
@@ -452,6 +507,11 @@ class MibCompiler:
 
         """
         self._sources = list(sources)
+        self._sourceNamespaces = {
+            source: namespace
+            for source, namespace in self._sourceNamespaces.items()
+            if source in self._sources
+        }
 
         logger.debug(
             "MIB source(s) replaced with: %s",
@@ -460,6 +520,91 @@ class MibCompiler:
         )
 
         return self
+
+    def add_namespaced_sources(
+        self, namespace: str, *sources: "AbstractReader"
+    ) -> "MibCompiler":
+        """Add ASN.1 MIB sources whose modules compile under *namespace*.
+
+        Two products can ship the same module name for two incompatible
+        modules -- a vendor that reused a name across a product line, say --
+        and a collector that monitors both needs both loaded at once. Compiled
+        under their own names the second copy would replace the first, so the
+        sources of such a group are registered under a namespace instead:
+        every module the group supplies compiles to ``namespace@name``, and
+        every import one of its modules makes that binds inside the group is
+        rewritten to match. OIDs, exported symbol names and the SNMP type
+        values are the module's own and are left alone.
+
+        A dependency the group does not carry binds to the shared sources --
+        the bundled base MIBs and anything added through
+        :py:meth:`add_sources` -- and is compiled once, under its own name,
+        for every namespace that imports it. A dependency the group carries
+        *and* the shared sources carry with different content binds to
+        neither: which one the module means cannot be told from the text, so
+        the module fails with :py:class:`~pysmi.error.PySmiNamespaceError`
+        rather than silently picking one. An identical shared copy is not a
+        conflict -- the dependency binds to it and is not duplicated into the
+        namespace.
+
+        Compiling asks for a namespaced module by its qualified name:
+        ``compile("vendor-a@VENDOR-MIB")``. An unqualified name never
+        resolves into a namespace, so sources added the ordinary way behave
+        exactly as they did before this existed.
+
+        Args:
+            namespace: the namespace to qualify this group's modules with.
+                Letters, digits, ``_``, ``-`` and ``.``, not starting with
+                ``-`` or ``.``; the separator ``@`` is excluded so a
+                qualified name always splits back apart.
+            sources: reader object(s) making up the group
+
+        Returns:
+            reference to itself (can be used for call chaining)
+
+        Raises:
+            PySmiError: the namespace is not a usable name, or one of the
+                sources is already registered under a different one.
+        """
+        if not _NAMESPACE_NAME.match(namespace):
+            raise error.PySmiError(
+                f"namespace {namespace!r} is not a usable name: expected "
+                f"letters, digits, '_', '-' and '.', not leading with '-' or '.'"
+            )
+
+        for source in sources:
+            existing = self._sourceNamespaces.get(source)
+
+            if existing is not None and existing != namespace:
+                raise error.PySmiError(
+                    f"source {source} is already registered under namespace "
+                    f"{existing!r}; it cannot also belong to {namespace!r}"
+                )
+
+            self._sourceNamespaces[source] = namespace
+
+        return self.add_sources(*sources)
+
+    def _sources_for(self, namespace: "str | None") -> list["AbstractReader"]:
+        """The sources a module request is resolved against.
+
+        A qualified name is served by its own namespace alone -- never by the
+        shared sources, and never by another namespace's. A plain name is
+        served by the shared sources alone, so registering a namespace cannot
+        change what an unqualified compile resolves to.
+        """
+        if namespace is None:
+            return [
+                source
+                for source in self._all_sources()
+                if source not in self._sourceNamespaces
+            ]
+
+        return [
+            source
+            for source in self._all_sources()
+            if self._sourceNamespaces.get(source) == namespace
+        ]
 
     def clear_parse_cache(self) -> "MibCompiler":
         """Drop every parse tree the configured cache holds.
@@ -563,6 +708,10 @@ class MibCompiler:
         what to build normally means its own collection, not pysmi's copy of
         the standard MIBs on top of it.
 
+        Modules of a namespaced source (see
+        :py:meth:`add_namespaced_sources`) are reported under their qualified
+        names, since those are the names :py:meth:`compile` resolves them by.
+
         Keyword Args:
             includeBundled: also enumerate the bundled base MIBs.
 
@@ -577,8 +726,15 @@ class MibCompiler:
         seen: dict[str, None] = {}
 
         for source in sources:
+            namespace = self._sourceNamespaces.get(source)
+
             for mibname in source.list_mibs():
-                seen.setdefault(mibname, None)
+                seen.setdefault(
+                    qualify_module_name(namespace, mibname)
+                    if namespace is not None
+                    else mibname,
+                    None,
+                )
 
         logger.debug(
             "configured sources hold %d MIB modules",
@@ -628,6 +784,25 @@ class MibCompiler:
     ) -> tuple[list[tuple["AbstractReader", MibInfo, str]], str]:
         """Every source that can supply *mibname*, the one to use first.
 
+        A qualified name (``namespace@module``, see
+        :py:meth:`add_namespaced_sources`) is asked of the namespace's own
+        sources under its plain name; a plain name is asked of the shared
+        sources. The ranking between the copies found is
+        :py:meth:`_candidates_from`'s, and is the same either way.
+
+        Returns:
+            The candidates, best first, and which rule put that one first --
+            one of the ``PRECEDENCE_*`` constants.
+        """
+        namespace, plainName = split_module_name(mibname)
+
+        return self._candidates_from(self._sources_for(namespace), plainName)
+
+    def _candidates_from(
+        self, sources: "list[AbstractReader]", mibname: str
+    ) -> tuple[list[tuple["AbstractReader", MibInfo, str]], str]:
+        """Every source that can supply *mibname*, the one to use first.
+
         The newest MODULE-IDENTITY revision wins, whatever the module is.
         Source order breaks the tie, and only the tie: a copy carrying no
         revision to compare, or every copy carrying the same one.
@@ -666,7 +841,7 @@ class MibCompiler:
         """
         candidates: list[tuple[AbstractReader, MibInfo, str]] = []
 
-        for source in self._all_sources():
+        for source in sources:
             if candidates and not getattr(source, "isLocal", False):
                 break
 
@@ -688,6 +863,94 @@ class MibCompiler:
         )
 
         return [candidates[i] for i in order], precedence
+
+    def _bind_import(self, namespace: str, imported: str) -> str:
+        """The module name an import in a *namespace* module resolves to.
+
+        An import names a module, nothing more, so which copy of that module
+        it means has to be decided here, where the namespace of the importing
+        module is known:
+
+        * the group carries it and the shared sources do not -- it is the
+          group's own, and the import is rewritten to the qualified name so
+          the compiled module asks for the copy it was written against;
+        * the shared sources carry it and the group does not -- it is a
+          common dependency, shared with every other namespace under its own
+          name;
+        * both carry it -- the copies are compared. Identical text is one
+          module in two places and binds to the shared copy, so it is not
+          compiled once per namespace. Different text is two modules of one
+          name and the import cannot be told apart -- that is refused, not
+          guessed at.
+
+        Args:
+            namespace: the namespace of the module doing the importing
+            imported: the module name as its IMPORTS clause states it
+
+        Returns:
+            The module name the import binds to, qualified or not.
+
+        Raises:
+            PySmiNamespaceError: the name is carried by the group and by the
+                shared sources with different content.
+        """
+        group, _ = self._candidates_from(self._sources_for(namespace), imported)
+
+        if not group:
+            return imported
+
+        shared, _ = self._candidates_from(self._sources_for(None), imported)
+
+        if shared and shared[0][1].digest != group[0][1].digest:
+            raise error.PySmiNamespaceError(
+                f"namespace {namespace!r} module imports {imported}, which its "
+                f"own sources carry at {group[0][1].path} and the shared "
+                f"sources carry, with different content, at "
+                f"{shared[0][1].path}; which one the import means cannot be "
+                f"told from the text"
+            )
+
+        if shared:
+            return imported
+
+        return qualify_module_name(namespace, imported)
+
+    def _namespace_module_tree(
+        self, namespace: str, mibTree: Any
+    ) -> "tuple[Any, str]":
+        """Rewrite a parsed module into its namespace, and its imports with it.
+
+        The module keeps its OIDs, its exported symbols and its type values --
+        those are what an SNMP peer sees, and namespacing is about keeping two
+        compiled copies apart, not about changing what either says. What moves
+        is the module's own name, qualified so the two copies coexist, and
+        every import that binds inside the group, qualified the same way so
+        the group resolves against itself and never against another
+        namespace's module of the same name.
+
+        Args:
+            namespace: the namespace of the source the module was read from
+            mibTree: the parse tree, as the parser produced it
+
+        Returns:
+            The rewritten tree, and the module's own name before rewriting --
+            the caller records it so the output can say where it came from.
+        """
+        moduleName, moduleOid, imports, declarations = mibTree
+
+        rebound: dict[str, list[str]] = {}
+
+        for module, symbols in (imports or {}).items():
+            rebound.setdefault(self._bind_import(namespace, module), []).extend(
+                symbols
+            )
+
+        return (
+            qualify_module_name(namespace, moduleName),
+            moduleOid,
+            rebound,
+            declarations,
+        ), moduleName
 
     def resolve(self, mibname: str) -> "MibResolution | None":
         """Which copy of *mibname* the configured sources supply, without compiling it.
@@ -803,7 +1066,9 @@ class MibCompiler:
         MIBs being processed.
 
         Args:
-            mibnames: list of ASN.1 MIBs names
+            mibnames: list of ASN.1 MIBs names. A module of a namespaced
+                source group is asked for by its qualified name,
+                ``namespace@module`` -- see :py:meth:`add_namespaced_sources`.
             options: options that affect the way PySMI components work
 
         Keyword Args:
@@ -864,6 +1129,8 @@ class MibCompiler:
         shadowedMibs: dict[str, list[str]] = {}
         precedenceOfMib: dict[str, str] = {}
         usedPathOfMib: dict[str, str] = {}
+        namespaceOfMib: dict[str, str] = {}
+        originalNameOfMib: dict[str, str] = {}
 
         while mibsToParse:
             mibname = mibsToParse.pop(0)
@@ -923,6 +1190,19 @@ class MibCompiler:
 
                 try:
                     for mibTree in self._parse_source(fileInfo.digest, fileData):
+                        namespace = self._sourceNamespaces.get(source)
+
+                        if namespace is not None:
+                            # The tree is this process's own deep copy of the
+                            # cached parse, so rewriting it here cannot leak
+                            # the namespace into another compile of the same
+                            # text.
+                            mibTree, originalName = self._namespace_module_tree(
+                                namespace, mibTree
+                            )
+                            namespaceOfMib[mibTree[0]] = namespace
+                            originalNameOfMib[mibTree[0]] = originalName
+
                         mibInfo, symbolTable = self._symbolgen.gen_code(
                             mibTree,
                             symbolTableMap,
@@ -964,7 +1244,7 @@ class MibCompiler:
 
                         mibsToParse.extend(mibInfo.imported)
 
-                        if fileInfo.name in mibnames:
+                        if fileInfo.name in mibnames or mibname in mibnames:
                             if mibInfo.name not in canonicalMibNames:
                                 canonicalMibNames[mibInfo.name] = []
                             canonicalMibNames[mibInfo.name].append(fileInfo.name)
@@ -1122,8 +1402,18 @@ class MibCompiler:
             comments = [
                 f"ASN.1 source {fileInfo.file or fileInfo.path}",
                 f"Source digest {fileInfo.digest}",
-                f"Produced by {packageName}-{packageVersion}",
             ]
+
+            if mibname in namespaceOfMib:
+                # A namespaced module's output name is not the name its ASN.1
+                # declares, so the output says both -- what it was, and which
+                # source group made it what it is now.
+                comments += [
+                    f"Original module name {originalNameOfMib[mibname]}",
+                    f"Source namespace {namespaceOfMib[mibname]}",
+                ]
+
+            comments.append(f"Produced by {packageName}-{packageVersion}")
 
             try:
                 mibInfo, mibData = self._codegen.gen_code(
@@ -1400,6 +1690,7 @@ class MibCompiler:
                         path=fileInfo.path,
                         file=fileInfo.file,
                         alias=fileInfo.name,
+                        namespace=namespaceOfMib.get(mibname, ""),
                         oid=mibInfo.oid,
                         oids=mibInfo.oids,
                         identity=mibInfo.identity,
@@ -1555,9 +1846,11 @@ class MibCompiler:
 
             stillSourced = False
 
-            for source in self._all_sources():
+            namespace, plainName = split_module_name(mibname)
+
+            for source in self._sources_for(namespace):
                 try:
-                    source.get_data(mibname)
+                    source.get_data(plainName)
                     stillSourced = True
                     break
 

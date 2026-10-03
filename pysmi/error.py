@@ -170,6 +170,16 @@ class PySmiReaderFileNotFoundError(PySmiReaderError):
     """
 
 
+class PySmiNamespaceError(PySmiError):
+    """A namespaced source group cannot be compiled consistently.
+
+    Raised when a module in a namespace imports a name that the namespace's
+    own sources and the shared sources both carry with different content, so
+    which module the import means cannot be told from the text. See
+    :py:meth:`~pysmi.compiler.MibCompiler.add_namespaced_sources`.
+    """
+
+
 class PySmiCodegenError(PySmiError):
     """A code generator could not produce output for a MIB.
 
