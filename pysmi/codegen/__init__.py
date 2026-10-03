@@ -9,9 +9,11 @@
 from pysmi.codegen.jsondoc import JsonCodeGen
 from pysmi.codegen.null import NullCodeGen
 from pysmi.codegen.pysnmp import PySnmpCodeGen
+from pysmi.codegen.sqlite import SqliteCodeGen
 
 __all__ = [
     "JsonCodeGen",
     "NullCodeGen",
     "PySnmpCodeGen",
+    "SqliteCodeGen",
 ]

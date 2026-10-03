@@ -567,13 +567,18 @@ class SymtableCodeGen(AbstractCodeGen):
         parents = [syntax[0][0]]
 
         if augmentation:
-            parents.append(self.trans_opers(augmentation))
+            augmentationName = self.trans_opers(augmentation)
+            parents.append(augmentationName)
+            symProps["augmentation"] = {
+                "module": self._importMap.get(augmentationName, self.moduleName[0]),
+                "object": augmentationName,
+            }
 
         if defval:  # XXX
             symProps["defval"] = defval
 
         if index and index[1]:
-            namepart, fakeIndexes, fakeSymSyntax = index
+            namepart, fakeIndexes, fakeSymSyntax, _indexEntries = index
             for fakeIdx, fakeSyntax in zip(fakeIndexes, fakeSymSyntax, strict=False):
                 fakeName = namepart + str(fakeIdx)
 
@@ -585,6 +590,11 @@ class SymtableCodeGen(AbstractCodeGen):
                 }
 
                 self.reg_sym(fakeName, fakeSymProps)
+
+        if index:
+            _namepart, _fakeIndexes, _fakeSymSyntax, indexEntries = index
+            if indexEntries:
+                symProps["indices"] = indexEntries
 
         self.reg_sym(pysmiName, symProps, parents)
 
@@ -835,14 +845,15 @@ class SymtableCodeGen(AbstractCodeGen):
 
         Returns:
             The prefix used to name synthetic columns, the sub-identifier of
-            each one, and its syntax.
+            each one, its syntax, and the normalized INDEX entries.
         """
         indexes = data[0]
 
         fakeIdxName = "pysmiFakeCol"
-        fakeIndexes, fakeSymsSyntax = [], []
+        fakeIndexes, fakeSymsSyntax, indexEntries = [], [], []
 
         for idx in indexes:
+            isImplied, rawIdxName = idx
             idxName = idx[1]
             if idxName in self.smiv1IdxTypes:  # SMIv1 support
                 idxType = idxName
@@ -850,11 +861,24 @@ class SymtableCodeGen(AbstractCodeGen):
                 objType = self.typeClasses.get(idxType, idxType)
                 objType = self.trans_opers(objType)
 
+                fakeSymName = f"{fakeIdxName}{self.fakeidx}"
                 fakeIndexes.append(self.fakeidx)
-                fakeSymsSyntax.append((("MibTableColumn", ""), objType))
+                fakeSymsSyntax.append(((objType, ""), ""))
+                idxName = fakeSymName
                 self.fakeidx += 1
 
-        return fakeIdxName, fakeIndexes, fakeSymsSyntax
+            else:
+                idxName = self.trans_opers(rawIdxName)
+
+            indexEntries.append(
+                (
+                    isImplied,
+                    self._importMap.get(idxName, self.moduleName[0]),
+                    idxName,
+                )
+            )
+
+        return fakeIdxName, fakeIndexes, fakeSymsSyntax, tuple(indexEntries)
 
     # noinspection PyUnusedLocal,PyUnusedLocal,PyMethodMayBeStatic
     def gen_integer_sub_type(
