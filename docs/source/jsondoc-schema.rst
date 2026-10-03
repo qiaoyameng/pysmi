@@ -248,6 +248,10 @@ Field                Type      Notes
 ``reference``        string    Text-gated. ``textualconvention`` only.
 ===================  ========  ======================================================
 
+The ``displayhint`` text is carried verbatim and never interpreted by the
+compiler. A consumer that wants to render or accept values under it compiles
+the string with :py:mod:`pysmi.displayhint` -- see :ref:`displayhint`.
+
 Neither carries an ``oid``: a type declaration names no node in the OID tree.
 
 objectidentity

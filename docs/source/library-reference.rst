@@ -56,6 +56,7 @@ This example showcases some of its features:
    /pysmi/corpus/buckets
    /pysmi/corpus/site
    /pysmi/registry
+   /pysmi/displayhint
    /pysmi/patches
 
 .. _camel-case-deprecation:
