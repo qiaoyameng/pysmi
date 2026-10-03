@@ -45,6 +45,7 @@ from pysmi.codegen.base import (
     with_repaired_imports,
 )
 from pysmi.mibinfo import MibInfo, normalise_revision
+from pysmi.namespace import namespaced_mib_name
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +231,8 @@ class PySnmpCodeGen(AbstractCodeGen):
     indent = " " * 4
     fakeidx = 1000  # starting index for fake symbols
 
+    supportsMibNamespaces = True
+
     # Template for the status assignment (duplicated across many codegen
     # methods; extracted to satisfy SonarQube S1192).
     _STATUS_TEMPLATE = """\
@@ -276,6 +279,8 @@ for _%(name)s_obj in [%(objects)s]:
         self._moduleRevision: str | None = None
         self._moduleLastUpdated: str | None = None
         self.moduleName: list[str] = ["DUMMY"]
+        self.moduleBinding: list[str] = ["DUMMY"]
+        self._moduleBindings: dict[str, str] = {}
         self.genRules: dict[str, Any] = {"text": True}
         self.symbolTable: dict[str, Any] = {}
 
@@ -293,6 +298,10 @@ for _%(name)s_obj in [%(objects)s]:
             return self.symsTable[symbol]
 
         return (symbol,)
+
+    def binding_name(self, moduleName: str) -> str:
+        """The generated MIBBuilder module binding for *moduleName*."""
+        return self._moduleBindings.get(moduleName, moduleName)
 
     @staticmethod
     def trans_opers(symbol: str) -> Any:
@@ -406,7 +415,7 @@ for _%(name)s_obj in [%(objects)s]:
                 outStr += ", ".join([self.trans_opers(s) for s in symbols])
                 if len(symbols) < 2:
                     outStr += ","
-                quotedSymbols = '", "'.join((module, *symbols))
+                quotedSymbols = '", "'.join((self.binding_name(module), *symbols))
                 outStr += f' = mibBuilder.importSymbols("{quotedSymbols}")\n'
 
         return outStr, tuple(sorted(imports))
@@ -431,7 +440,7 @@ for _%(name)s_obj in [%(objects)s]:
         outStr = ""
 
         for idx in range(numFuncCalls):
-            outStr += 'mibBuilder.exportSymbols("' + self.moduleName[0] + '", '
+            outStr += 'mibBuilder.exportSymbols("' + self.moduleBinding[0] + '", '
             outStr += ", ".join(exports[254 * idx : 254 * (idx + 1)]) + ")\n"
 
         return outStr
@@ -787,7 +796,7 @@ for _%(name)s_obj in [%(objects)s]:
         if objects:
             objects = [
                 '("'
-                + self._importMap.get(obj, self.moduleName[0])
+                + self.binding_name(self._importMap.get(obj, self.moduleName[0]))
                 + '", "'
                 + self.trans_opers(obj)
                 + '")'
@@ -851,7 +860,7 @@ for _%(name)s_obj in [%(objects)s]:
         if objects:
             objects = [
                 '("'
-                + self._importMap.get(obj, self.moduleName[0])
+                + self.binding_name(self._importMap.get(obj, self.moduleName[0]))
                 + '", "'
                 + self.trans_opers(obj)
                 + '")'
@@ -913,7 +922,7 @@ for _%(name)s_obj in [%(objects)s]:
         if objects:
             objects = [
                 '("'
-                + self._importMap.get(obj, self.moduleName[0])
+                + self.binding_name(self._importMap.get(obj, self.moduleName[0]))
                 + '", "'
                 + self.trans_opers(obj)
                 + '")'
@@ -1065,7 +1074,7 @@ for _%(name)s_obj in [%(objects)s]:
             outStr += (
                 augmentation
                 + '.registerAugmentions(("'
-                + self._importMap.get(name, self.moduleName[0])
+                + self.binding_name(self._importMap.get(name, self.moduleName[0]))
                 + '", "'
                 + name
                 + '"))\n'
@@ -1121,7 +1130,7 @@ for _%(name)s_obj in [%(objects)s]:
         if objects:
             objects = [
                 '("'
-                + self._importMap.get(obj, self.moduleName[0])
+                + self.binding_name(self._importMap.get(obj, self.moduleName[0]))
                 + '", "'
                 + self.trans_opers(obj)
                 + '")'
@@ -1296,7 +1305,9 @@ for _%(name)s_obj in [%(objects)s]:
         objects = []
 
         for complianceModule in data[0]:
-            name = complianceModule[0] or self.moduleName[0]
+            name = self.binding_name(
+                complianceModule[0] or self.moduleName[0]
+            )
             objects += [
                 '("' + name + '", "' + self.trans_opers(compl) + '")'
                 for compl in complianceModule[1]
@@ -1754,7 +1765,9 @@ for _%(name)s_obj in [%(objects)s]:
                 "("
                 + str(idx[0])
                 + ', "'
-                + self._importMap.get(idxName, self.moduleName[0])
+                + self.binding_name(
+                    self._importMap.get(idxName, self.moduleName[0])
+                )
                 + '", "'
                 + idxName
                 + '")'
@@ -2196,6 +2209,8 @@ for _%(name)s_obj in [%(objects)s]:
             lambda symbol, text: re.sub(r"\s+", " ", text)
         )
         self.symbolTable = symbolTable
+        namespace = kwargs.get("mibNamespace", "")
+        self._moduleBindings = dict(kwargs.get("mibBindings", {}))
         self._rows.clear()
         self._cols.clear()
         self._exports.clear()
@@ -2210,6 +2225,12 @@ for _%(name)s_obj in [%(objects)s]:
         self._moduleRevision = None
         self._moduleLastUpdated = None
         self.moduleName[0], moduleOid, imports, declarations = ast
+        self.moduleBinding[0] = (
+            namespaced_mib_name(self.moduleName[0], namespace)
+            if namespace
+            else self.moduleName[0]
+        )
+        self._moduleBindings.setdefault(self.moduleName[0], self.moduleBinding[0])
 
         out, importedModules = self.gen_imports(
             with_repaired_imports(imports, symbolTable, self.moduleName[0])
@@ -2230,6 +2251,14 @@ for _%(name)s_obj in [%(objects)s]:
 
         out += self.gen_exports()
 
+        if namespace:
+            metadata = (
+                f'PYSNMP_MIB_NAMESPACE = {namespace!r}\n'
+                f'PYSNMP_ORIGINAL_MODULE = {self.moduleName[0]!r}\n\n'
+            )
+        else:
+            metadata = ""
+
         # Annotated, because the reset above narrows the attribute to None for
         # the rest of this function: mypy does not see the clause handlers
         # assign it in between.
@@ -2248,10 +2277,13 @@ for _%(name)s_obj in [%(objects)s]:
             # that can parse Python. See pysnmp/pysnmp#198.
             out = f"PYSNMP_MODULE_REVISION = {revision!r}\n\n" + out
 
+        out = metadata + out
+
         if "comments" in kwargs:
             out = "".join([f"# {x}\n" for x in kwargs["comments"]]) + "#\n" + out
             out = (
-                f"#\n# PySNMP MIB module {self.moduleName[0]} (https://pysnmp.github.io/pysmi/)\n"
+                "#\n# PySNMP MIB module "
+                f"{self.moduleBinding[0]} (https://pysnmp.github.io/pysmi/)\n"
                 + out
             )
 
@@ -2272,12 +2304,18 @@ for _%(name)s_obj in [%(objects)s]:
         return MibInfo(
             oid=moduleOid,
             identity=self._moduleIdentityOid,
-            name=self.moduleName[0],
+            name=self.moduleBinding[0],
+            namespace=namespace,
+            sourceName=self.moduleName[0] if namespace else "",
             revision=self._moduleRevision,
             oids=[],
             enterprise=None,
             compliance=[],
-            imported=tuple(x for x in importedModules if x not in self.fakeMibs),
+            imported=tuple(
+                self.binding_name(x)
+                for x in importedModules
+                if x not in self.fakeMibs
+            ),
         ), out
 
     def gen_index(self, processed: dict[str, Any], **kwargs: Any) -> str:

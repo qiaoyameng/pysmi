@@ -416,6 +416,12 @@ class MibInfo:
     #: SHA-256 of the ASN.1 source, newlines normalised to ``\n``
     digest: str = ""
 
+    #: explicit version namespace the generated module belongs to
+    namespace: str = ""
+
+    #: original MIB module name before a namespace binding was applied
+    sourceName: str = ""
+
     def __init__(self, **kwargs: Any) -> None:
         """Set the given fields, leaving the rest at their class defaults.
 

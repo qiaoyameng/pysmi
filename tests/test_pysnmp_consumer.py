@@ -38,7 +38,18 @@ from pysmi.codegen.pysnmp_surface import (
     NODE_METHODS,
     VALUE_METHODS,
 )
+from pysmi.compiler import MibCompiler
+from pysmi.parser import SmiV2Parser
+from pysmi.searcher import StubSearcher
+from pysmi.writer.pyfile import PyFileWriter
 from tests.harness import render_pysnmp
+from tests.test_mib_namespaces import (
+    DictReader as NamespaceDictReader,
+    conflict_mib as namespaced_conflict_mib,
+    dependency as namespaced_dependency,
+    shared_mib as namespaced_shared_mib,
+    sharing_mib as namespaced_sharing_mib,
+)
 from tests.test_spec_index import MULTI_MIB
 from tests.test_spec_objecttype import ACCESS_MIB
 from tests.test_standard_corpus import LOAD_ORDER, compiled, documents
@@ -757,6 +768,128 @@ def _serving(directory):
         httpd.server_close()
         thread.join(timeout=5)
 
+
+
+class MibNamespaceConsumerTestCase(unittest.TestCase):
+    """Two generated MIB versions coexist in one PySNMP MibBuilder."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.output = pathlib.Path(self.tmp.name) / "mibs"
+        self.writer = PyFileWriter(str(self.output))
+        self.writer.pyCompile = False
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def compiler(self, namespace, root, enum_value):
+        compiler = MibCompiler(
+            SmiV2Parser(),
+            PySnmpCodeGen(),
+            self.writer,
+            useBundledMibs=True,
+        )
+        compiler.add_searchers(StubSearcher(*PySnmpCodeGen.baseMibs))
+        compiler.add_sources(
+            NamespaceDictReader(
+                {
+                    "CONFLICT-MIB": namespaced_conflict_mib(
+                        root, enum_value, enum_value
+                    ),
+                    "DEP-MIB": namespaced_dependency(
+                        namespace, enum_value, enum_value
+                    ),
+                    "SHARING-MIB": namespaced_sharing_mib(root + 10),
+                }
+            ),
+            namespace=namespace,
+        )
+        compiler.add_sources(
+            NamespaceDictReader(
+                {"SHARED-PUBLIC-MIB": namespaced_shared_mib()}
+            )
+        )
+        return compiler
+
+    def test_incompatible_copies_load_together_without_type_leaks(self):
+        first = self.compiler("vendor1", 50001, 11)
+        second = self.compiler("vendor2", 50002, 22)
+        first.compile(
+            "CONFLICT-MIB", "SHARING-MIB", namespace="vendor1", rebuild=True
+        )
+        second.compile(
+            "CONFLICT-MIB", "SHARING-MIB", namespace="vendor2", rebuild=True
+        )
+
+        from pysnmp.smi.builder import DirMibSource, MibBuilder
+
+        mibBuilder = MibBuilder()
+        mibBuilder.setMibSources(
+            *mibBuilder.getMibSources(), DirMibSource(str(self.output))
+        )
+        mibBuilder.loadModules("vendor1@CONFLICT-MIB", "vendor2@CONFLICT-MIB")
+
+        (firstScalar,) = mibBuilder.importSymbols(
+            "vendor1@CONFLICT-MIB", "conflictScalar"
+        )
+        (secondScalar,) = mibBuilder.importSymbols(
+            "vendor2@CONFLICT-MIB", "conflictScalar"
+        )
+        (firstDep,) = mibBuilder.importSymbols("vendor1@DEP-MIB", "depValue")
+        (secondDep,) = mibBuilder.importSymbols("vendor2@DEP-MIB", "depValue")
+
+        self.assertEqual(
+            (1, 3, 6, 1, 4, 1, 50001, 1), tuple(firstScalar.getName())
+        )
+        self.assertEqual(
+            (1, 3, 6, 1, 4, 1, 50002, 1), tuple(secondScalar.getName())
+        )
+        self.assertEqual(
+            "namespaceValue", firstScalar.getSyntax().clone(11).prettyPrint()
+        )
+        self.assertEqual(
+            "namespaceValue", secondScalar.getSyntax().clone(22).prettyPrint()
+        )
+        self.assertNotEqual(tuple(firstDep.getName()), tuple(secondDep.getName()))
+
+        (firstRow,) = mibBuilder.importSymbols(
+            "vendor1@CONFLICT-MIB", "conflictEntry"
+        )
+        (secondRow,) = mibBuilder.importSymbols(
+            "vendor2@CONFLICT-MIB", "conflictEntry"
+        )
+        self.assertEqual(
+            (0, "vendor1@CONFLICT-MIB", "conflictIndex"),
+            firstRow.getIndexNames()[0],
+        )
+        self.assertEqual(
+            (0, "vendor2@CONFLICT-MIB", "conflictIndex"),
+            secondRow.getIndexNames()[0],
+        )
+        (firstIndexColumn,) = mibBuilder.importSymbols(
+            "vendor1@CONFLICT-MIB", "conflictIndex"
+        )
+        (secondIndexColumn,) = mibBuilder.importSymbols(
+            "vendor2@CONFLICT-MIB", "conflictIndex"
+        )
+        firstIndexColumn.getSyntax().clone(11)
+        secondIndexColumn.getSyntax().clone(22)
+        with self.assertRaises(Exception):
+            firstIndexColumn.getSyntax().clone(22)
+        with self.assertRaises(Exception):
+            secondIndexColumn.getSyntax().clone(11)
+
+        mibBuilder.importSymbols("vendor1@SHARING-MIB", "sharingMib")
+        mibBuilder.importSymbols("vendor2@SHARING-MIB", "sharingMib")
+        (sharedValue,) = mibBuilder.importSymbols(
+            "SHARED-PUBLIC-MIB", "sharedPublicValue"
+        )
+        self.assertIs(
+            sharedValue,
+            mibBuilder.importSymbols(
+                "SHARED-PUBLIC-MIB", "sharedPublicValue"
+            )[0],
+        )
 
 suite = unittest.TestLoader().loadTestsFromModule(sys.modules[__name__])
 

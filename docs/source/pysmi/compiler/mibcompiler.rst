@@ -73,6 +73,39 @@ Every parse in the second row is of text not parsed before in that build. The
 saving grows with the namespace count, since the shared tree is a fixed cost
 paid once rather than once per namespace.
 
+Loading incompatible copies of one MIB name
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Two vendors can publish different modules under the same MIB module name.
+Loading both copies with ordinary output names makes the second copy replace
+the first in a ``MibBuilder``. For PySNMP output, a source set can instead be
+tagged with an explicit version namespace:
+
+.. code-block:: python
+
+   compiler.add_sources(FileReader("vendor1/mibs"), namespace="vendor1")
+   compiler.add_sources(FileReader("vendor2/mibs"), namespace="vendor2")
+
+   compiler.compile("VENDOR-MIB", namespace="vendor1")
+   compiler.compile("VENDOR-MIB", namespace="vendor2")
+
+The generated bindings are ``vendor1@VENDOR-MIB`` and
+``vendor2@VENDOR-MIB``. Imports between modules selected by the same source
+set are rewritten consistently. OID values, MIB symbol names, labels and the
+actual PySNMP/PyASN.1 syntax objects remain those declared by the MIB.
+
+Readers without a namespace remain shared dependencies. For example, standard
+base MIBs and a genuinely common vendor dependency are emitted and loaded once
+under their original names. If a dependency is available both inside the named
+set and from an unnamespaced source, its binding is ambiguous and compilation
+fails rather than silently choosing one copy.
+
+Generated modules also expose ``PYSNMP_MIB_NAMESPACE`` and
+``PYSNMP_ORIGINAL_MODULE`` constants, and their header comments record the
+namespace and original MIB name. These make an output file traceable back to
+the version source it was built from. Compilation without ``namespace`` keeps
+the historical module names and output format.
+
 Why swapping sources cannot serve a stale answer
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

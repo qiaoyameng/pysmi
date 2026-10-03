@@ -38,6 +38,11 @@ from pysmi.mibinfo import (
     source_digest,
     strip_comments,
 )
+from pysmi.namespace import (
+    NAMESPACE_SEPARATOR,
+    namespaced_mib_name,
+    validate_namespace,
+)
 from pysmi.parser.base import AbstractParser
 from pysmi.reader.base import AbstractReader
 from pysmi.searcher.base import AbstractSearcher
@@ -103,6 +108,25 @@ def rank_by_revision(revisions: Sequence[str | None]) -> tuple[list[int], str]:
     )
 
     return order, PRECEDENCE_NEWEST_REVISION
+
+
+def _rank_candidates(
+    candidates: list[tuple["AbstractReader", str, MibInfo, str]],
+    preferConfiguredSources: bool = False,
+    bundledSource: "AbstractReader | None" = None,
+) -> tuple[list[tuple["AbstractReader", str, MibInfo, str]], str]:
+    """Rank source copies of one MIB name using the compiler's precedence."""
+    if len(candidates) < 2:
+        return candidates, ""
+
+    if preferConfiguredSources:
+        candidates.sort(key=lambda c: c[0] is bundledSource)
+
+    order, precedence = rank_by_revision(
+        [revision_of(data) for _, _, _, data in candidates]
+    )
+
+    return [candidates[i] for i in order], precedence
 
 
 @cache
@@ -184,6 +208,10 @@ class MibStatus(str):
     file: str
     #: Name the MIB was found under, when it differs from its module name.
     alias: str
+    #: Explicit version namespace of a generated module binding.
+    namespace: str
+    #: Original MIB module name behind a namespaced generated binding.
+    sourceName: str
     #: MODULE-IDENTITY OID.
     oid: str
     #: All OIDs defined in the module.
@@ -347,8 +375,8 @@ class MibCompiler:
         self._codegen = codegen
         self._symbolgen = SymtableCodeGen()
         self._writer = writer
-        self._sources: list[AbstractReader] = []
-        self._priority_sources: list[AbstractReader] = []
+        self._sources: list[tuple[AbstractReader, str]] = []
+        self._priority_sources: list[tuple[AbstractReader, str]] = []
         self._searchers: list[AbstractSearcher] = []
         self._borrowers: list[AbstractBorrower] = []
 
@@ -388,7 +416,11 @@ class MibCompiler:
             self._bundledSource = PackageReader(self.bundledMibsPackage)
             self.add_priority_sources(self._bundledSource)
 
-    def add_sources(self, *sources: "AbstractReader") -> "MibCompiler":
+    def add_sources(
+        self,
+        *sources: "AbstractReader",
+        namespace: str = "",
+    ) -> "MibCompiler":
         """Add more ASN.1 MIB source repositories.
 
         MibCompiler.compile will invoke each of configured source objects
@@ -407,21 +439,33 @@ class MibCompiler:
         Args:
             sources: reader object(s)
 
+        Keyword Args:
+            namespace: version namespace served by these readers. Modules
+                compiled with that namespace get distinct generated module
+                bindings, while unnamespaced readers remain shared
+                dependencies.
+
         Returns:
             reference to itself (can be used for call chaining)
 
         """
-        self._sources.extend(sources)
+        if namespace:
+            validate_namespace(namespace)
+        self._sources.extend((source, namespace) for source in sources)
 
         logger.debug(
             "current MIB source(s): %s",
-            ", ".join(str(x) for x in self._sources),
-            extra={"sources": [str(x) for x in self._sources]},
+            ", ".join(str(x) for x, _ in self._sources),
+            extra={"sources": [str(x) for x, _ in self._sources]},
         )
 
         return self
 
-    def set_sources(self, *sources: "AbstractReader") -> "MibCompiler":
+    def set_sources(
+        self,
+        *sources: "AbstractReader",
+        namespace: str | None = None,
+    ) -> "MibCompiler":
         """Replace the ASN.1 sources, keeping everything else about this compiler.
 
         For a driver compiling many source sets in turn -- a corpus build over
@@ -447,16 +491,32 @@ class MibCompiler:
         Args:
             sources: reader object(s) to use from now on
 
+        Keyword Args:
+            namespace: replace only sources carrying this namespace; the
+                default replaces every non-priority source, preserving the
+                historical behaviour.
+
         Returns:
             reference to itself (can be used for call chaining)
 
         """
-        self._sources = list(sources)
+        if namespace is not None:
+            validate_namespace(namespace)
+
+        tagged = [(source, namespace or "") for source in sources]
+
+        if namespace is None or namespace == "":
+            self._sources = tagged
+        else:
+            self._sources = [
+                entry for entry in self._sources if entry[1] != namespace
+            ]
+            self._sources.extend(tagged)
 
         logger.debug(
             "MIB source(s) replaced with: %s",
-            ", ".join(str(x) for x in self._sources),
-            extra={"sources": [str(x) for x in self._sources]},
+            ", ".join(str(x) for x, _ in self._sources),
+            extra={"sources": [str(x) for x, _ in self._sources]},
         )
 
         return self
@@ -512,7 +572,11 @@ class MibCompiler:
 
         return copy.deepcopy(cached)
 
-    def add_priority_sources(self, *sources: "AbstractReader") -> "MibCompiler":
+    def add_priority_sources(
+        self,
+        *sources: "AbstractReader",
+        namespace: str = "",
+    ) -> "MibCompiler":
         """Add ASN.1 MIB source repositories to be asked ahead of the rest.
 
         Every one of these is tried, for every MIB, before any
@@ -532,21 +596,28 @@ class MibCompiler:
         Args:
             sources: reader object(s)
 
+        Keyword Args:
+            namespace: version namespace served by these priority readers.
+
         Returns:
             reference to itself (can be used for call chaining)
 
         """
-        self._priority_sources.extend(sources)
+        if namespace:
+            validate_namespace(namespace)
+        self._priority_sources.extend((source, namespace) for source in sources)
 
         logger.debug(
             "current priority MIB source(s): %s",
-            ", ".join(str(x) for x in self._priority_sources),
-            extra={"priority_sources": [str(x) for x in self._priority_sources]},
+            ", ".join(str(x) for x, _ in self._priority_sources),
+            extra={
+                "priority_sources": [str(x) for x, _ in self._priority_sources]
+            },
         )
 
         return self
 
-    def _all_sources(self) -> list["AbstractReader"]:
+    def _all_sources(self) -> list[tuple["AbstractReader", str]]:
         """Every configured source, in the order they are asked."""
         return [*self._priority_sources, *self._sources]
 
@@ -569,14 +640,18 @@ class MibCompiler:
         Returns:
             Module names in source order, each appearing once.
         """
-        sources = self._all_sources()
+        sources = list(self._all_sources())
 
         if not includeBundled and self._bundledSource is not None:
-            sources = [x for x in sources if x is not self._bundledSource]
+            sources = [
+                (source, namespace)
+                for source, namespace in sources
+                if source is not self._bundledSource
+            ]
 
         seen: dict[str, None] = {}
 
-        for source in sources:
+        for source, _namespace in sources:
             for mibname in source.list_mibs():
                 seen.setdefault(mibname, None)
 
@@ -623,9 +698,40 @@ class MibCompiler:
 
         return fileInfo, fileData
 
+    def _read_candidates(
+        self,
+        sources: list[tuple["AbstractReader", str]],
+        mibname: str,
+        force_all: bool = False,
+    ) -> list[tuple["AbstractReader", str, MibInfo, str]]:
+        """Read every useful copy of *mibname* from *sources*.
+
+        Namespaced builds cannot safely leave another configured source of the
+        same dependency unexamined: that source may be the shared copy an
+        ambiguous import has to be reported against. The ordinary source-order
+        path still stops after a remote hit, because probing every remote for
+        every standard module would turn compilation into many extra requests.
+        """
+        candidates: list[tuple[AbstractReader, str, MibInfo, str]] = []
+
+        for source, _namespace in sources:
+            if (
+                candidates
+                and not force_all
+                and not getattr(source, "isLocal", False)
+            ):
+                break
+
+            found = self._read_source(source, mibname)
+
+            if found:
+                candidates.append((source, _namespace, *found))
+
+        return candidates
+
     def _candidate_sources(
-        self, mibname: str
-    ) -> tuple[list[tuple["AbstractReader", MibInfo, str]], str]:
+        self, mibname: str, namespace: str = ""
+    ) -> tuple[list[tuple["AbstractReader", str, MibInfo, str]], str]:
         """Every source that can supply *mibname*, the one to use first.
 
         The newest MODULE-IDENTITY revision wins, whatever the module is.
@@ -664,32 +770,50 @@ class MibCompiler:
             The candidates, best first, and which rule put that one first --
             one of the ``PRECEDENCE_*`` constants.
         """
-        candidates: list[tuple[AbstractReader, MibInfo, str]] = []
+        if namespace:
+            validate_namespace(namespace)
+            groupEntries = [
+                entry for entry in self._all_sources() if entry[1] == namespace
+            ]
+            sharedEntries = [
+                entry for entry in self._all_sources() if not entry[1]
+            ]
 
-        for source in self._all_sources():
-            if candidates and not getattr(source, "isLocal", False):
-                break
+            groupCandidates = self._read_candidates(
+                groupEntries, mibname, force_all=True
+            )
+            sharedCandidates = self._read_candidates(
+                sharedEntries, mibname, force_all=True
+            )
 
-            found = self._read_source(source, mibname)
+            if groupCandidates and sharedCandidates:
+                paths = [
+                    info.path
+                    for candidates in (groupCandidates, sharedCandidates)
+                    for _, _, info, _ in candidates
+                ]
+                raise error.PySmiError(
+                    f"ambiguous binding for MIB {mibname} in namespace "
+                    f"{namespace!r}: supplied by both namespaced and shared "
+                    f"sources: {', '.join(paths)}"
+                )
 
-            if found:
-                candidates.append((source, *found))
+            candidates = groupCandidates or sharedCandidates
+        else:
+            entries = [entry for entry in self._all_sources() if not entry[1]]
+            candidates = self._read_candidates(entries, mibname)
 
-        if len(candidates) < 2:
-            return candidates, ""
-
-        if self._preferConfiguredSources:
-            # Stable, so the caller's own sources keep their order among
-            # themselves and only the bundled copy moves.
-            candidates.sort(key=lambda c: c[0] is self._bundledSource)
-
-        order, precedence = rank_by_revision(
-            [revision_of(data) for _, _, data in candidates]
+        return _rank_candidates(
+            candidates,
+            preferConfiguredSources=self._preferConfiguredSources,
+            bundledSource=self._bundledSource,
         )
 
-        return [candidates[i] for i in order], precedence
-
-    def resolve(self, mibname: str) -> "MibResolution | None":
+    def resolve(
+        self,
+        mibname: str,
+        namespace: str = "",
+    ) -> "MibResolution | None":
         """Which copy of *mibname* the configured sources supply, without compiling it.
 
         :py:meth:`compile` answers this on the way past, on
@@ -711,12 +835,12 @@ class MibCompiler:
             What the sources hold for that name, or ``None`` when none of
             them has it.
         """
-        candidates, precedence = self._candidate_sources(mibname)
+        candidates, precedence = self._candidate_sources(mibname, namespace)
 
         if not candidates:
             return None
 
-        source, mibInfo, mibData = candidates[0]
+        source, _sourceNamespace, mibInfo, mibData = candidates[0]
 
         return MibResolution(
             name=mibname,
@@ -726,7 +850,7 @@ class MibCompiler:
             digest=mibInfo.digest,
             shadowed=tuple(
                 info.path
-                for _, info, _ in candidates[1:]
+                for _, _, info, _ in candidates[1:]
                 if info.digest != mibInfo.digest
             ),
             precedence=precedence,
@@ -810,6 +934,9 @@ class MibCompiler:
             strictSources: fail a MIB that more than one configured source
                 has a different copy of, rather than taking one and
                 reporting the other on ``MibStatus.shadowed``.
+            namespace: compile readers tagged with this version namespace as
+                namespaced bindings. A dependency also available from an
+                unnamespaced source is an ambiguous binding and fails.
 
         Returns:
             A dictionary of MIB module names processed (keys) and *MibStatus*
@@ -853,6 +980,15 @@ class MibCompiler:
             reproduce it later.
 
         """
+        namespace = options.get("namespace", "")
+        if namespace:
+            validate_namespace(namespace)
+            if not getattr(self._codegen, "supportsMibNamespaces", False):
+                raise error.PySmiCodegenError(
+                    f"{type(self._codegen).__name__} does not support MIB "
+                    "namespaces; use the PySNMP code generator"
+                )
+
         processed: dict[str, MibStatus] = {}
         parsedMibs: dict[str, Any] = {}
         failedMibs: dict[str, Any] = {}
@@ -864,6 +1000,8 @@ class MibCompiler:
         shadowedMibs: dict[str, list[str]] = {}
         precedenceOfMib: dict[str, str] = {}
         usedPathOfMib: dict[str, str] = {}
+        bindingNames: dict[str, str] = {}
+        namespacedModules: set[str] = set()
 
         while mibsToParse:
             mibname = mibsToParse.pop(0)
@@ -876,28 +1014,28 @@ class MibCompiler:
                 logger.debug("MIB %s already failed", mibname, extra={"mib": mibname})
                 continue
 
-            candidates, precedence = self._candidate_sources(mibname)
+            candidates, precedence = self._candidate_sources(mibname, namespace)
 
             shadowed = [
                 info.path
-                for _, info, _ in candidates[1:]
-                if info.digest != candidates[0][1].digest
+                for _, _, info, _ in candidates[1:]
+                if info.digest != candidates[0][2].digest
             ]
 
             if shadowed:
                 shadowedMibs[mibname] = shadowed
                 precedenceOfMib[mibname] = precedence
-                usedPathOfMib[mibname] = candidates[0][1].path
+                usedPathOfMib[mibname] = candidates[0][2].path
 
                 logger.warning(
                     "%s taken from %s by %s, shadowing a different copy at %s",
                     mibname,
-                    candidates[0][1].path,
+                    candidates[0][2].path,
                     precedence,
                     ", ".join(shadowed),
                     extra={
                         "mib": mibname,
-                        "path": candidates[0][1].path,
+                        "path": candidates[0][2].path,
                         "precedence": precedence,
                         "shadowed": shadowed,
                     },
@@ -905,16 +1043,26 @@ class MibCompiler:
 
                 if options.get("strictSources"):
                     conflict = error.PySmiError(
-                        f"{mibname} found at {candidates[0][1].path} and, with different content, "
+                        f"{mibname} found at {candidates[0][2].path} and, "
+                        "with different content, "
                         f"at {', '.join(shadowed)}"
                     )
                     conflict.mibname = mibname
 
                     failedMibs[mibname] = conflict
-                    processed[mibname] = statusFailed.set_options(error=conflict)
+                    outputName = (
+                        namespaced_mib_name(mibname, namespace)
+                        if namespace
+                        else mibname
+                    )
+                    processed[outputName] = statusFailed.set_options(
+                        error=conflict,
+                        namespace=namespace,
+                        sourceName=mibname if namespace else "",
+                    )
                     continue
 
-            for source, fileInfo, fileData in candidates:
+            for source, sourceNamespace, fileInfo, fileData in candidates:
                 logger.debug(
                     "trying source %s",
                     source,
@@ -932,6 +1080,17 @@ class MibCompiler:
                         symbolTableMap[mibInfo.name] = symbolTable
 
                         parsedMibs[mibInfo.name] = fileInfo, mibInfo, mibTree
+                        inNamespace = bool(namespace and sourceNamespace == namespace)
+
+                        if inNamespace:
+                            mibInfo.namespace = namespace
+                            mibInfo.sourceName = mibInfo.name
+                            bindingNames[mibInfo.name] = namespaced_mib_name(
+                                mibInfo.name, namespace
+                            )
+                            namespacedModules.add(mibInfo.name)
+
+                        bindingNames.setdefault(mibInfo.name, mibInfo.name)
 
                         failedMibs.pop(mibname, None)
 
@@ -955,7 +1114,7 @@ class MibCompiler:
                         if shadowedMibs.get(mibname):
                             shadowedMibs[mibInfo.name] = [
                                 info.path
-                                for _, info, _ in candidates
+                                for _, _, info, _ in candidates
                                 if info.path != fileInfo.path
                                 and info.digest != fileInfo.digest
                             ]
@@ -1031,15 +1190,18 @@ class MibCompiler:
 
         for mibname in tuple(parsedMibs):
             fileInfo, mibInfo, mibTree = parsedMibs[mibname]
+            outputName = bindingNames.get(mibname, mibname)
 
             logger.debug(
-                "checking if %s requires updating", mibname, extra={"mib": mibname}
+                "checking if %s requires updating",
+                outputName,
+                extra={"mib": outputName},
             )
 
             for searcher in self._searchers:
                 try:
                     searcher.file_exists(
-                        mibname,
+                        outputName,
                         fileInfo.mtime,
                         rebuild=bool(options.get("rebuild")),
                         digest=fileInfo.digest,
@@ -1048,33 +1210,39 @@ class MibCompiler:
                 except error.PySmiFileNotFoundError:
                     logger.debug(
                         "no compiled MIB %s available through %s",
-                        mibname,
+                        outputName,
                         searcher,
-                        extra={"mib": mibname, "searcher": str(searcher)},
+                        extra={"mib": outputName, "searcher": str(searcher)},
                     )
                     continue
 
                 except error.PySmiFileNotModifiedError:
                     logger.debug(
                         "will be using existing compiled MIB %s found by %s",
-                        mibname,
+                        outputName,
                         searcher,
-                        extra={"mib": mibname, "searcher": str(searcher)},
+                        extra={"mib": outputName, "searcher": str(searcher)},
                     )
                     del parsedMibs[mibname]
-                    processed[mibname] = statusUntouched
+                    processed[outputName] = statusUntouched.set_options(
+                        path=fileInfo.path,
+                        file=fileInfo.file,
+                        alias=fileInfo.name,
+                        namespace=mibInfo.namespace,
+                        sourceName=mibInfo.sourceName or mibname,
+                    )
                     break
 
                 except error.PySmiError as exc:
                     exc.searcher = searcher
-                    exc.mibname = mibname
-                    exc.msg += _AT_MIB_SUFFIX % mibname
+                    exc.mibname = outputName
+                    exc.msg += _AT_MIB_SUFFIX % outputName
                     logger.debug(
                         "error from %s: %s",
                         searcher,
                         exc,
                         extra={
-                            "mib": mibname,
+                            "mib": outputName,
                             "searcher": str(searcher),
                             "error": str(exc),
                         },
@@ -1084,18 +1252,24 @@ class MibCompiler:
             else:
                 logger.debug(
                     "no suitable compiled MIB %s found anywhere",
-                    mibname,
-                    extra={"mib": mibname},
+                    outputName,
+                    extra={"mib": outputName},
                 )
 
                 if options.get("noDeps") and mibname not in canonicalMibNames:
                     logger.debug(
                         "excluding imported MIB %s from code generation",
-                        mibname,
-                        extra={"mib": mibname},
+                        outputName,
+                        extra={"mib": outputName},
                     )
                     del parsedMibs[mibname]
-                    processed[mibname] = statusUntouched
+                    processed[outputName] = statusUntouched.set_options(
+                        path=fileInfo.path,
+                        file=fileInfo.file,
+                        alias=fileInfo.name,
+                        namespace=mibInfo.namespace,
+                        sourceName=mibInfo.sourceName or mibname,
+                    )
                     continue
 
         logger.debug(
@@ -1124,6 +1298,13 @@ class MibCompiler:
                 f"Source digest {fileInfo.digest}",
                 f"Produced by {packageName}-{packageVersion}",
             ]
+            if mibInfo.namespace:
+                comments.extend(
+                    [
+                        f"MIB namespace {mibInfo.namespace}",
+                        f"Original MIB module {mibInfo.sourceName or mibInfo.name}",
+                    ]
+                )
 
             try:
                 mibInfo, mibData = self._codegen.gen_code(
@@ -1132,6 +1313,8 @@ class MibCompiler:
                     comments=comments,
                     genTexts=options.get("genTexts"),
                     textFilter=options.get("textFilter"),
+                    mibNamespace=mibInfo.namespace,
+                    mibBindings=bindingNames,
                 )
 
                 builtMibs[mibname] = fileInfo, mibInfo, mibData
@@ -1151,8 +1334,9 @@ class MibCompiler:
 
             except error.PySmiError as exc:
                 exc.handler = self._codegen
-                exc.mibname = mibname
-                exc.msg += _AT_MIB_SUFFIX % mibname
+                outputName = bindingNames.get(mibname, mibname)
+                exc.mibname = outputName
+                exc.msg += _AT_MIB_SUFFIX % outputName
 
                 logger.debug(
                     "error from %s: %s",
@@ -1165,7 +1349,11 @@ class MibCompiler:
                     },
                 )
 
-                processed[mibname] = statusFailed.set_options(error=exc)
+                processed[outputName] = statusFailed.set_options(
+                    error=exc,
+                    namespace=namespace,
+                    sourceName=mibname if mibname in namespacedModules else "",
+                )
 
                 failedMibs[mibname] = exc
                 del parsedMibs[mibname]
@@ -1182,6 +1370,14 @@ class MibCompiler:
         #
 
         for mibname in failedMibs.copy():
+            if mibname in namespacedModules:
+                logger.debug(
+                    "not borrowing namespaced MIB %s",
+                    mibname,
+                    extra={"mib": mibname},
+                )
+                continue
+
             if options.get("noDeps") and mibname not in canonicalMibNames:
                 logger.debug(
                     "excluding imported MIB %s from borrowing",
@@ -1344,7 +1540,15 @@ class MibCompiler:
                     mibname
                     for mibname, (_, mibInfo, _) in builtMibs.items()
                     if mibname not in tainted
-                    and tainted.intersection(mibInfo.imported or ())
+                    and (
+                        tainted.intersection(mibInfo.imported or ())
+                        or bindingNames.get(mibname, mibname) in tainted
+                        or any(
+                            bindingNames.get(failed, failed)
+                            in (mibInfo.imported or ())
+                            for failed in tainted
+                        )
+                    )
                 }
 
                 if not spreading:
@@ -1353,7 +1557,15 @@ class MibCompiler:
                 tainted |= spreading
 
             for mibname in tainted.intersection(builtMibs):
-                processed[mibname] = statusUnprocessed
+                outputName = bindingNames.get(mibname, mibname)
+                fileInfo, mibInfo, _ = builtMibs[mibname]
+                processed[outputName] = statusUnprocessed.set_options(
+                    path=fileInfo.path,
+                    file=fileInfo.file,
+                    alias=fileInfo.name,
+                    namespace=mibInfo.namespace,
+                    sourceName=mibInfo.sourceName or mibname,
+                )
                 del builtMibs[mibname]
 
             logger.debug(
@@ -1379,24 +1591,25 @@ class MibCompiler:
 
         for mibname in builtMibs.copy():
             fileInfo, mibInfo, mibData = builtMibs[mibname]
+            outputName = bindingNames.get(mibname, mibname)
 
             try:
                 if options.get("writeMibs", True):
                     self._writer.put_data(
-                        mibname, mibData, dryRun=bool(options.get("dryRun"))
+                        outputName, mibData, dryRun=bool(options.get("dryRun"))
                     )
 
                 logger.debug(
                     "%s stored by %s",
-                    mibname,
+                    outputName,
                     self._writer,
-                    extra={"mib": mibname, "writer": str(self._writer)},
+                    extra={"mib": outputName, "writer": str(self._writer)},
                 )
 
                 del builtMibs[mibname]
 
-                if mibname not in processed:
-                    processed[mibname] = statusCompiled.set_options(
+                if outputName not in processed:
+                    processed[outputName] = statusCompiled.set_options(
                         path=fileInfo.path,
                         file=fileInfo.file,
                         alias=fileInfo.name,
@@ -1407,6 +1620,8 @@ class MibCompiler:
                         enterprise=mibInfo.enterprise,
                         compliance=mibInfo.compliance,
                         notification=mibInfo.notification,
+                        namespace=mibInfo.namespace,
+                        sourceName=mibInfo.sourceName or mibname,
                         repaired=symbolTableMap.get(mibname, {}).get(
                             REPAIRED_IMPORTS_KEY, {}
                         ),
@@ -1416,21 +1631,25 @@ class MibCompiler:
 
             except error.PySmiError as exc:
                 exc.handler = self._codegen
-                exc.mibname = mibname
-                exc.msg += _AT_MIB_SUFFIX % mibname
+                exc.mibname = outputName
+                exc.msg += _AT_MIB_SUFFIX % outputName
 
                 logger.debug(
                     "error %s from %s",
                     exc,
                     self._writer,
                     extra={
-                        "mib": mibname,
+                        "mib": outputName,
                         "writer": str(self._writer),
                         "error": str(exc),
                     },
                 )
 
-                processed[mibname] = statusFailed.set_options(error=exc)
+                processed[outputName] = statusFailed.set_options(
+                    error=exc,
+                    namespace=mibInfo.namespace,
+                    sourceName=mibInfo.sourceName or mibname,
+                )
                 failedMibs[mibname] = exc
                 del builtMibs[mibname]
 
@@ -1439,7 +1658,8 @@ class MibCompiler:
         # to something other than the caller's own would go unmentioned. The
         # compiled ones already carry this; give it to the rest too.
         for mibname, shadowed in shadowedMibs.items():
-            status = processed.get(mibname)
+            outputName = bindingNames.get(mibname, mibname)
+            status = processed.get(outputName)
 
             if not shadowed or status is None or getattr(status, "shadowed", None):
                 continue
@@ -1450,9 +1670,9 @@ class MibCompiler:
             }
 
             if not getattr(status, "path", None):
-                carried["path"] = usedPathOfMib[mibname]
+                carried["path"] = usedPathOfMib.get(mibname, "")
 
-            processed[mibname] = status.set_options(**carried)
+            processed[outputName] = status.set_options(**carried)
 
         logger.debug(
             "MIBs modified: %s",
@@ -1546,7 +1766,7 @@ class MibCompiler:
         """
         processed: dict[str, MibStatus] = {}
 
-        for source in self._all_sources():
+        for source, _namespace in self._all_sources():
             source.clear_cache()
 
         for mibname in self._writer.list_data():
@@ -1554,10 +1774,24 @@ class MibCompiler:
                 continue
 
             stillSourced = False
+            sourceMibName = mibname
+            outputNamespace = ""
 
-            for source in self._all_sources():
+            if NAMESPACE_SEPARATOR in mibname:
+                outputNamespace, sourceMibName = mibname.split(
+                    NAMESPACE_SEPARATOR, 1
+                )
+
+            sourcesToCheck = [
+                (source, namespace)
+                for source, namespace in self._all_sources()
+                if not namespace
+                or namespace == outputNamespace
+            ]
+
+            for source, _namespace in sourcesToCheck:
                 try:
-                    source.get_data(mibname)
+                    source.get_data(sourceMibName)
                     stillSourced = True
                     break
 
