@@ -139,3 +139,47 @@ class identity while accepting different grammars: a trailing comma in
 
 :py:meth:`~pysmi.compiler.MibCompiler.clear_parse_cache` empties whichever
 provider is configured. It is never needed for correctness.
+
+Reusing whole compilation products
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The parse cache still parses every module once per change: an incremental
+build re-generates everything, because nothing downstream of the parser is
+kept. Passing ``productCache`` to the constructor closes that gap -- the
+generated document itself is cached, and a module whose inputs are all
+unchanged is not re-generated at all:
+
+.. code-block:: python
+
+   from pysmi.cache import FileProductCache
+
+   compiler = MibCompiler(
+       SmiV1CompatParser(),
+       JsonCodeGen(),
+       CallbackWriter(store),
+       productCache=FileProductCache("/var/cache/pysmi-products"),
+   )
+
+A hit is keyed on everything that can change the output: the source actually
+selected (its identity and the digest of its full text), the generation
+parameters that reach the code generator (``genTexts``, ``textFilter``,
+``repairImports``), the generator's class and the pysmi version, and the
+comment-stripped digest of every module in the transitive import closure. So
+a TEXTUAL-CONVENTION redefined in an imported module rebuilds everything
+importing it, a source-priority change that selects a different copy rebuilds
+what was taken from it, and a generator upgrade rebuilds everything. A
+comment-only change rebuilds exactly the module that was edited: its own
+product records the digest of its full text, while a dependency only ever
+reaches a module's output through its parse tree, which comments never enter.
+Import cycles invalidate as a whole -- every member of a cycle carries every
+other member in its key, so one change rebuilds the cycle, deterministically.
+
+A cache hit is not a skip: the cached product is handed to the writer as
+usual, so the destination sees every module whether or not it was regenerated
+this run. A failed module is never published as a product, and
+``rebuild=True`` bypasses the cache the same way it bypasses the searchers.
+
+:py:class:`~pysmi.cache.product.InMemoryProductCache` covers a build that
+runs in one process; :py:class:`~pysmi.cache.product.FileProductCache`
+survives process exit, with the same unpickling trust boundary as the file
+parse cache. The cache is off by default.

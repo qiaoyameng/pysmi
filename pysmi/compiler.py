@@ -30,6 +30,7 @@ from pysmi._aliases import deprecated_camel_case
 from pysmi.borrower.base import AbstractBorrower
 from pysmi.cache.base import AbstractParseCache
 from pysmi.cache.memory import InMemoryParseCache
+from pysmi.cache.product import AbstractProductCache
 from pysmi.codegen.base import REPAIRED_IMPORTS_KEY, AbstractCodeGen
 from pysmi.codegen.symtable import SymtableCodeGen
 from pysmi.mibinfo import (
@@ -299,6 +300,7 @@ class MibCompiler:
         useBundledMibs: bool = True,
         preferConfiguredSources: bool = False,
         parseCache: "AbstractParseCache | None" = None,
+        productCache: "AbstractProductCache | None" = None,
     ) -> None:
         """Creates an instance of *MibCompiler* class.
 
@@ -342,6 +344,20 @@ class MibCompiler:
                 caller's own code -- which matters, because a provider that
                 stores trees outside this process reconstructs arbitrary
                 Python objects when it reads them back.
+            productCache: where to keep whole compilation products between
+                :py:meth:`compile` calls, as an
+                :py:class:`~pysmi.cache.product.AbstractProductCache`, so a
+                module whose inputs are all unchanged is not re-generated at
+                all. Defaults to ``None`` -- every needed module is
+                generated, the behaviour of every release before the cache
+                existed. :py:class:`~pysmi.cache.product.InMemoryProductCache`
+                covers a build that runs in one process;
+                :py:class:`~pysmi.cache.product.FileProductCache` survives
+                process exit, for a build system invoking the compiler once
+                per change set. What a hit is keyed on, and the rule for
+                comment-only changes, is documented on
+                :py:class:`~pysmi.cache.product.AbstractProductCache` and in
+                the *Note* section of :py:meth:`compile`.
         """
         self._parser = parser
         self._codegen = codegen
@@ -357,6 +373,18 @@ class MibCompiler:
         self._parseCache: AbstractParseCache = (
             InMemoryParseCache() if parseCache is None else parseCache
         )
+        #: Where whole compilation products are kept between
+        #: :py:meth:`compile` calls, or ``None`` when every needed module is
+        #: generated -- the default, and the behaviour of every release
+        #: before the cache existed.
+        self._productCache: AbstractProductCache | None = productCache
+        #: Identifies what would do the generating, so a cached product is
+        #: never served for a different generator. The pysmi version is
+        #: folded in by :py:meth:`_product_cache_key` at compile time rather
+        #: than here, so a test -- or a caller -- substituting one codegen
+        #: for another of the same class still gets distinct keys only where
+        #: the distinction is real.
+        self._codegenId = f"{type(codegen).__module__}.{type(codegen).__qualname__}"
         #: Identifies what would do the parsing, so a cached tree is never
         #: offered to a different producer. Only a cache outliving this
         #: process can encounter that, and one of those is exactly what
@@ -475,6 +503,95 @@ class MibCompiler:
         self._parseCache.clear()
 
         return self
+
+    def clear_product_cache(self) -> "MibCompiler":
+        """Drop every compilation product the configured cache holds.
+
+        Never needed for correctness -- a key is derived from everything the
+        product depends on, so an entry is only ever reused for identical
+        input. It is here for a caller that wants the space back at a known
+        point. A no-op when no product cache is configured.
+
+        Returns:
+            reference to itself (can be used for call chaining)
+
+        """
+        if self._productCache is not None:
+            self._productCache.clear()
+
+        return self
+
+    def _product_cache_key(
+        self, mibname: str, parsedMibs: dict[str, Any], options: dict[str, Any]
+    ) -> "str | None":
+        """The product cache key for one parsed module, or ``None``.
+
+        The key carries everything a product depends on, so a hit is only
+        ever served for inputs identical in every respect that can change
+        the output:
+
+        * the selected source -- where the module was read from and the
+          digest of its full text, comments included, because the generated
+          document records both. A source-priority change that selects a
+          different copy is different key material;
+        * the generation parameters that reach the code generator, the
+          generator's class, and the pysmi version;
+        * the comment-stripped digest of every module in the transitive
+          import closure, so a changed TEXTUAL-CONVENTION in an imported
+          module regenerates everything importing it, while a comment-only
+          change there regenerates nothing. The closure walk keeps a visited
+          set, so an import cycle terminates and every member of the cycle
+          carries every other member in its key -- one change anywhere in a
+          cycle regenerates the whole cycle, deterministically.
+
+        ``None`` when any module in the closure is not itself successfully
+        parsed -- a module generated against an incomplete symbol table has
+        no well-defined product, so it is neither served from nor offered to
+        the cache.
+        """
+        closure: dict[str, str] = {}
+        stack = [mibname]
+
+        while stack:
+            name = stack.pop()
+
+            if name in closure:
+                continue
+
+            entry = parsedMibs.get(name)
+
+            if entry is None:
+                return None
+
+            fileInfo, mibInfo, _ = entry
+            closure[name] = fileInfo.semanticDigest or fileInfo.digest
+            stack.extend(mibInfo.imported or ())
+
+        fileInfo, mibInfo, _ = parsedMibs[mibname]
+
+        textFilter = options.get("textFilter") or None
+
+        material = "\n".join(
+            [
+                "pysmi-product-v1",
+                f"producer={packageName}-{packageVersion}",
+                f"codegen={self._codegenId}",
+                f"genTexts={bool(options.get('genTexts'))}",
+                f"textFilter={textFilter!r}",
+                f"repairImports={bool(options.get('repairImports', True))}",
+                f"module={mibInfo.name}",
+                f"source-path={fileInfo.path}",
+                f"source-file={fileInfo.file}",
+                f"source-digest={fileInfo.digest}",
+                *(
+                    f"import={name}:{closure[name]}"
+                    for name in sorted(closure)
+                    if name != mibname
+                ),
+            ]
+        )
+
+        return sha256(material.encode()).hexdigest()
 
     def _parse_cache_key(self, digest: str) -> str:
         """The cache key for text with the given digest.
@@ -620,6 +737,13 @@ class MibCompiler:
             return None
 
         fileInfo.digest = source_digest(fileData)
+
+        if self._productCache is not None:
+            # What a dependency contributes to another module's output goes
+            # through its parse tree, which comments never enter -- so the
+            # import side of a product key is derived from comment-stripped
+            # text. Computed here, once per read, rather than per key.
+            fileInfo.semanticDigest = source_digest(strip_comments(fileData))
 
         return fileInfo, fileData
 
@@ -852,6 +976,35 @@ class MibCompiler:
             them -- so a build can record what it resolved to, why, and
             reproduce it later.
 
+            **Incremental compilation.** When the compiler was given a
+            ``productCache``, a module whose inputs are all unchanged is not
+            re-generated: the product is served from the cache and handed to
+            the writer as usual, so the destination sees every module whether
+            or not it was regenerated this run. A hit is keyed on the source
+            actually selected (its identity and the digest of its full
+            text), on the generation parameters that reach the code
+            generator (``genTexts``, ``textFilter``, ``repairImports``), on
+            the generator's class and the pysmi version, and on the
+            comment-stripped digest of every module in the transitive import
+            closure. So a TEXTUAL-CONVENTION redefined in an imported module
+            regenerates everything importing it, a source-priority change
+            that selects a different copy regenerates what was taken from
+            it, and a generator upgrade regenerates everything.
+
+            The comment rule: a comment-only change to a module regenerates
+            exactly that module -- its own product records the digest of its
+            full text -- and nothing that imports it, because a dependency
+            reaches a module's output only through its parse tree, which
+            comments never enter. Import cycles have a deterministic
+            invalidation scope: every member of a cycle carries every other
+            member in its key, so one change regenerates the whole cycle.
+
+            A failed module is never published as a product: only a
+            successful generation whose whole import closure resolved is
+            stored. ``rebuild=True`` bypasses the cache for reading, the
+            same way it bypasses the searchers, and refreshes what it
+            regenerates.
+
         """
         processed: dict[str, MibStatus] = {}
         parsedMibs: dict[str, Any] = {}
@@ -1026,6 +1179,22 @@ class MibCompiler:
         )
 
         #
+        # Key every parsed module for the product cache, while the full
+        # parse set is still at hand -- the searchers below are about to
+        # drop up-to-date modules from it, and a dependent's key has to
+        # carry its dependencies whether or not they are being regenerated
+        # themselves.
+        #
+
+        productKeys: dict[str, str | None] = {}
+
+        if self._productCache is not None:
+            for mibname in parsedMibs:
+                productKeys[mibname] = self._product_cache_key(
+                    mibname, parsedMibs, options
+                )
+
+        #
         # See what MIBs need generating
         #
 
@@ -1112,6 +1281,32 @@ class MibCompiler:
         for mibname in parsedMibs.copy():
             fileInfo, mibInfo, mibTree = parsedMibs[mibname]
 
+            productKey = productKeys.get(mibname)
+
+            if (
+                productKey is not None
+                and self._productCache is not None
+                and not options.get("rebuild")
+            ):
+                cachedProduct = self._productCache.get(productKey)
+
+                if cachedProduct is not None:
+                    mibData, cachedMibInfo = cachedProduct
+
+                    # A copy, for the same reason the parse cache hands out
+                    # copies: what is stored must never be what the caller
+                    # goes on to mutate.
+                    builtMibs[mibname] = fileInfo, copy.deepcopy(cachedMibInfo), mibData
+                    del parsedMibs[mibname]
+
+                    logger.debug(
+                        "reusing cached compilation product for %s",
+                        mibname,
+                        extra={"mib": mibname},
+                    )
+
+                    continue
+
             logger.debug(
                 "compiling %s read from %s",
                 mibname,
@@ -1136,6 +1331,14 @@ class MibCompiler:
 
                 builtMibs[mibname] = fileInfo, mibInfo, mibData
                 del parsedMibs[mibname]
+
+                if productKey is not None and self._productCache is not None:
+                    # Only a successful generation is ever stored, and only
+                    # against a key whose whole import closure resolved --
+                    # a failed module has no product, and a partial closure
+                    # has no key, so a failure can never be published as a
+                    # success by a later run.
+                    self._productCache.set(productKey, (mibData, mibInfo))
 
                 logger.debug(
                     "%s read from %s and compiled by %s",

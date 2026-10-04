@@ -416,6 +416,12 @@ class MibInfo:
     #: SHA-256 of the ASN.1 source, newlines normalised to ``\n``
     digest: str = ""
 
+    #: SHA-256 of the ASN.1 source with comments stripped. Only filled in
+    #: when the compiler is configured with a product cache, which keys
+    #: dependency identity on it -- a comment cannot change what an imported
+    #: module contributes to another module's output.
+    semanticDigest: str = ""
+
     def __init__(self, **kwargs: Any) -> None:
         """Set the given fields, leaving the rest at their class defaults.
 

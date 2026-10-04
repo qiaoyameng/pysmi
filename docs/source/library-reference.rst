@@ -127,6 +127,31 @@ objects when it reads them back.
    /pysmi/cache/fileparsecache
    /pysmi/cache/nullparsecache
 
+Product caches
+--------------
+
+A *product cache* sits one step later than the parse cache: it holds what the
+code generator emitted for a module, so an incremental build regenerates only
+what its changes actually reach. A hit is keyed on the source actually
+selected, on the generation parameters, on the generator's class and the
+pysmi version, and on the comment-stripped digest of every module in the
+transitive import closure -- so a TEXTUAL-CONVENTION redefined in an imported
+module rebuilds everything importing it, while a comment-only change rebuilds
+exactly the module that was edited. Import cycles invalidate as a whole: every
+member of a cycle carries every other member in its key.
+
+The cache is off by default; pass a provider as ``productCache`` to
+:py:class:`~pysmi.compiler.MibCompiler`. The provider contract, including the
+trust boundary of a serializing provider, is
+:py:class:`~pysmi.cache.product.AbstractProductCache`.
+
+.. toctree::
+   :maxdepth: 2
+
+   /pysmi/cache/abstractproductcache
+   /pysmi/cache/inmemoryproductcache
+   /pysmi/cache/fileproductcache
+
 Conditional compilation
 -----------------------
 
@@ -303,4 +328,3 @@ them out individually:
 
    ``debug.setLogger()`` and ``debug.Debug()`` still work, but are
    deprecated in favour of ``debug.enableDebugLogging()``.
-
