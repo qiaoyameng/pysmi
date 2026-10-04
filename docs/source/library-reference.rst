@@ -127,6 +127,36 @@ objects when it reads them back.
    /pysmi/cache/fileparsecache
    /pysmi/cache/nullparsecache
 
+Build caches
+------------
+
+A parse cache saves the parsing; a *build cache* saves everything after it.
+Where a build is run repeatedly over a slowly-changing source set -- the
+incremental rebuild of a corpus -- a build cache holds the rendered modules
+so that only what actually changed is generated again.
+
+The cache is off by default and opted into per compiler, as a
+:py:class:`~pysmi.cache.base.AbstractBuildCache` passed to
+:py:class:`~pysmi.compiler.MibCompiler`. What a hit is decided on is
+everything that can change the product: the semantic content of the source
+copy that was selected, the generation options, the generator's identity and
+version, and the transitive closure of the module's imports. An imported
+TEXTUAL-CONVENTION changing its range therefore rebuilds every module that
+imports it, directly or not, while a comment touched anywhere rebuilds
+nothing -- comments never reach the parse tree, so they cannot change any
+output mode. Modules that import each other in a cycle share one fate: a
+change to any member rebuilds them all. Only a module that was generated and
+written without error is ever cached, so a failure is never served back as a
+success.
+
+.. toctree::
+   :maxdepth: 2
+
+   /pysmi/cache/abstractbuildcache
+   /pysmi/cache/inmemorybuildcache
+   /pysmi/cache/filebuildcache
+   /pysmi/cache/nullbuildcache
+
 Conditional compilation
 -----------------------
 
@@ -303,4 +333,3 @@ them out individually:
 
    ``debug.setLogger()`` and ``debug.Debug()`` still work, but are
    deprecated in favour of ``debug.enableDebugLogging()``.
-

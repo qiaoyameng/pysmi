@@ -4,7 +4,7 @@
 # Copyright (c) 2015-2019, Ilya Etingof <etingof@gmail.com>
 # License: https://github.com/pysnmp/pysmi/blob/main/LICENSE.rst
 #
-"""Parse trees kept on disk, so they outlive the process that built them."""
+"""Parse trees and compiled products kept on disk, outliving their process."""
 
 import logging
 import os
@@ -12,7 +12,8 @@ import pickle
 import tempfile
 from typing import Any
 
-from pysmi.cache.base import AbstractParseCache
+from pysmi.cache.base import AbstractBuildCache, AbstractParseCache
+from pysmi.mibinfo import MibInfo
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,176 @@ class FileParseCache(AbstractParseCache):
         Entries are recognised by :py:attr:`ENTRY_PREFIX`, so a file the
         directory holds for some other reason survives -- including one that
         happens to be a pickle.
+        """
+        try:
+            names = os.listdir(self._path)
+
+        except OSError:
+            return
+
+        for name in names:
+            if not (
+                name.startswith(self.ENTRY_PREFIX) and name.endswith(self.ENTRY_SUFFIX)
+            ):
+                continue
+
+            try:
+                os.unlink(os.path.join(self._path, name))
+
+            except OSError:
+                pass
+
+
+class FileBuildCache(AbstractBuildCache):
+    """Holds compiled products as files in a directory.
+
+    The provider for an incremental build that is not one process: a build
+    driven as a shell loop starts a fresh interpreter per pass, so an
+    in-memory cache is empty every time, while a directory survives and only
+    the modules whose inputs changed are regenerated.
+
+    .. warning::
+
+       **Reading this cache reconstructs arbitrary Python objects.** A
+       stored product holds a :py:class:`~pysmi.mibinfo.MibInfo`, and reading
+       one back means unpickling, which executes whatever the file says to
+       execute. Point this at a directory only your own build writes, and
+       treat it with the same care as a directory of executables.
+
+    Every entry is stored together with the key it answers, and a read
+    verifies the pair before handing anything back: an entry that does not
+    name the key asked for, does not unpickle, or is not the shape a product
+    has is logged and treated as a miss. A damaged cache therefore costs a
+    regeneration and can never serve a wrong product -- corruption fails
+    closed, never open.
+
+    Args:
+        path: directory to hold the entries. Created if it does not exist.
+    """
+
+    def __init__(self, path: str) -> None:
+        """Create a cache backed by the directory at *path*."""
+        self._path = path
+
+        os.makedirs(path, exist_ok=True)
+
+    def __repr__(self) -> str:
+        """Name the class and the directory."""
+        return f"{self.__class__.__name__}({self._path!r})"
+
+    #: Prefixed onto every entry file, so :py:meth:`clear` removes only what
+    #: this cache wrote. Distinct from the parse cache's prefix, since the
+    #: two may share a directory.
+    ENTRY_PREFIX = "pysmi-build-"
+
+    #: Extension for entry files.
+    ENTRY_SUFFIX = ".pickle"
+
+    def _entry(self, key: str) -> str:
+        """The file an entry lives in.
+
+        The key is composed by the compiler and hashed, so it is already a
+        safe file name; ``basename`` confines it to the cache directory by
+        construction rather than trusting it to stay there.
+        """
+        name = self.ENTRY_PREFIX + os.path.basename(key) + self.ENTRY_SUFFIX
+
+        return os.path.join(self._path, name)
+
+    def get(self, key: str) -> "tuple[MibInfo, Any] | None":
+        """The product stored under *key*, or ``None`` on a miss or any failure."""
+        entry = self._entry(key)
+
+        try:
+            with open(entry, "rb") as fd:
+                # The directory is the trust boundary, and the class
+                # docstring says so: an entry is only ever one this build
+                # wrote.
+                storedKey, product = pickle.load(fd)  # noqa: S301
+
+        except FileNotFoundError:
+            return None
+
+        # Unpickling raises whatever the stored graph raises, and unpacking
+        # raises on anything that is not a pair. A cache is an optimisation,
+        # so every one of those is a miss.
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "discarding unreadable cache entry %s: %s",
+                entry,
+                exc,
+                extra={"entry": entry},
+            )
+            return None
+
+        # The stored key must answer the key asked for. A corrupted or
+        # misplaced entry that unpickles cleanly is still not this product.
+        if storedKey != key:
+            logger.debug(
+                "ignoring cache entry %s: stored key does not match",
+                entry,
+                extra={"entry": entry},
+            )
+            return None
+
+        # Shape check, not a safety one -- by here the pickle has already
+        # run. It catches an entry that is merely wrong: written by something
+        # else, or by a version whose products were a different shape.
+        if not (
+            isinstance(product, tuple)
+            and len(product) == 2
+            and isinstance(product[0], MibInfo)
+            and isinstance(product[1], (str, bytes))
+        ):
+            logger.debug(
+                "ignoring cache entry %s: not a compiled product",
+                entry,
+                extra={"entry": entry},
+            )
+            return None
+
+        return product
+
+    def set(self, key: str, product: "tuple[MibInfo, Any]") -> None:
+        """Store *product*, atomically, so a reader never sees a partial write."""
+        entry = self._entry(key)
+
+        try:
+            fd, temporary = tempfile.mkstemp(dir=self._path, suffix=".partial")
+
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    pickle.dump(
+                        (key, product), handle, protocol=pickle.HIGHEST_PROTOCOL
+                    )
+
+                # Rename is atomic within a directory, so a concurrent build
+                # reading this key sees either the previous entry or this
+                # one, never a half-written file.
+                os.replace(temporary, entry)
+
+            except BaseException:
+                # Do not leave the partial behind for the next run to trip on.
+                try:
+                    os.unlink(temporary)
+
+                except OSError:
+                    pass
+
+                raise
+
+        # Failing to store is not a compilation failure: a full disk, a
+        # read-only directory or an unpicklable product all just mean no
+        # entry.
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("could not cache %s: %s", entry, exc, extra={"entry": entry})
+
+    def clear(self) -> None:
+        """Remove every entry this cache wrote, and nothing else.
+
+        Entries are recognised by :py:attr:`ENTRY_PREFIX`, so a file the
+        directory holds for some other reason survives -- including a parse
+        cache's entries, if the two share a directory.
         """
         try:
             names = os.listdir(self._path)

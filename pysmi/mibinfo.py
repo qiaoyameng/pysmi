@@ -366,6 +366,56 @@ def source_digest(source: str) -> str:
     return "sha256:" + hashlib.sha256(normalised.encode("utf-8")).hexdigest()
 
 
+def semantic_digest(source: str) -> str:
+    """Return the SHA-256 of a MIB source's significant content.
+
+    What reaches the parser is a token stream: the lexer has already
+    discarded every ASN.1 comment and all whitespace layout, and normalised
+    the tokens themselves (a number's leading zeros, a binary string's
+    padding). Two sources that lex to the same stream are the same input to
+    everything downstream of it, so this digest is taken over that stream.
+    Comments and layout never reach it; anything that can change the parse,
+    down to a DESCRIPTION's punctuation, does.
+
+    Where :py:func:`source_digest` identifies the text, this identifies
+    what the text *says*. It is the right key for a cache of anything
+    derived from the parse tree: a comment-only edit, or a reformatting
+    that moves no token, cannot change what is generated.
+
+    The stream is read with the relaxed-dialect lexer, the widest one pysmi
+    has, so anything any parser accepts is tokenised here. Should lexing
+    still fail, the digest of the raw text is the fallback: it identifies a
+    narrower equivalence class, which costs cache hits and never correctness.
+
+    Args:
+        source: the ASN.1 source of a MIB module.
+
+    Returns:
+        The hex digest, prefixed with the algorithm, e.g. ``sha256:1f3a...``.
+    """
+    lexer = _module_name_lexer()
+    lexer.reset()
+    lexer.lexer.input(source)
+
+    tokens: list[str] = []
+
+    try:
+        while True:
+            token = lexer.lexer.token()
+
+            if token is None:
+                break
+
+            # NUL cannot appear in a token's value -- no token rule matches
+            # it -- so it separates fields without ambiguity.
+            tokens.append(f"{token.type}\x00{token.value}\x00")
+
+    except Exception:  # noqa: BLE001 - fall back to identifying the text
+        return source_digest(source)
+
+    return "sha256:" + hashlib.sha256("".join(tokens).encode("utf-8")).hexdigest()
+
+
 class MibInfo:
     """What PySMI knows about one MIB module.
 

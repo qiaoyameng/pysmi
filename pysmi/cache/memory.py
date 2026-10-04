@@ -9,7 +9,8 @@
 from collections import OrderedDict
 from typing import Any
 
-from pysmi.cache.base import AbstractParseCache
+from pysmi.cache.base import AbstractBuildCache, AbstractParseCache
+from pysmi.mibinfo import MibInfo
 
 
 class InMemoryParseCache(AbstractParseCache):
@@ -71,4 +72,56 @@ class InMemoryParseCache(AbstractParseCache):
 
     def clear(self) -> None:
         """Discard every held tree."""
+        self._entries.clear()
+
+
+class InMemoryBuildCache(AbstractBuildCache):
+    """Holds compiled products in memory for the lifetime of the cache object.
+
+    The default for a build that runs in one process and asks for product
+    caching at all. Nothing is serialized, so there is no trust boundary and
+    no reconstruction cost.
+
+    Bounded, evicting least-recently-used, so a build over many modules keeps
+    the shared standard products -- which are asked for in every namespace --
+    and lets the single-use vendor ones fall out. As with the parse cache,
+    the bound has to exceed what one pass over a source set touches: a scan
+    longer than the cache evicts ahead of the reader and the hit rate is
+    zero rather than reduced.
+
+    Args:
+        maxEntries: how many products to hold. A value of 0 or less means
+            unbounded, for a caller that would rather run out of memory than
+            regenerate.
+    """
+
+    def __init__(self, maxEntries: int = 2048) -> None:
+        """Create a cache bounded to *maxEntries* products."""
+        self._entries: OrderedDict[str, tuple[MibInfo, Any]] = OrderedDict()
+        self._maxEntries = maxEntries
+
+    def __repr__(self) -> str:
+        """Name the class and its bound."""
+        return f"{self.__class__.__name__}(maxEntries={self._maxEntries})"
+
+    def get(self, key: str) -> "tuple[MibInfo, Any] | None":
+        """The product stored under *key*, marking the entry recently used."""
+        product = self._entries.get(key)
+
+        if product is not None:
+            self._entries.move_to_end(key)
+
+        return product
+
+    def set(self, key: str, product: "tuple[MibInfo, Any]") -> None:
+        """Store *product*, evicting the least recently used to stay in bounds."""
+        self._entries[key] = product
+        self._entries.move_to_end(key)
+
+        if self._maxEntries > 0:
+            while len(self._entries) > self._maxEntries:
+                self._entries.popitem(last=False)
+
+    def clear(self) -> None:
+        """Discard every held product."""
         self._entries.clear()

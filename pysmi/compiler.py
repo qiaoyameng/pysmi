@@ -28,13 +28,15 @@ from pysmi import __version__ as packageVersion
 from pysmi import error
 from pysmi._aliases import deprecated_camel_case
 from pysmi.borrower.base import AbstractBorrower
-from pysmi.cache.base import AbstractParseCache
+from pysmi.cache.base import AbstractBuildCache, AbstractParseCache
 from pysmi.cache.memory import InMemoryParseCache
+from pysmi.cache.null import NullBuildCache
 from pysmi.codegen.base import REPAIRED_IMPORTS_KEY, AbstractCodeGen
 from pysmi.codegen.symtable import SymtableCodeGen
 from pysmi.mibinfo import (
     MibInfo,
     normalise_revision,
+    semantic_digest,
     source_digest,
     strip_comments,
 )
@@ -299,6 +301,7 @@ class MibCompiler:
         useBundledMibs: bool = True,
         preferConfiguredSources: bool = False,
         parseCache: "AbstractParseCache | None" = None,
+        buildCache: "AbstractBuildCache | None" = None,
     ) -> None:
         """Creates an instance of *MibCompiler* class.
 
@@ -342,6 +345,24 @@ class MibCompiler:
                 caller's own code -- which matters, because a provider that
                 stores trees outside this process reconstructs arbitrary
                 Python objects when it reads them back.
+            buildCache: where to keep compiled products between
+                :py:meth:`compile` calls, as an
+                :py:class:`~pysmi.cache.base.AbstractBuildCache`. A module
+                whose inputs are all unchanged is then served from the cache
+                instead of being regenerated -- the key covers the selected
+                source's semantic content, the generation options, the code
+                generator's identity and version, and the transitive import
+                closure, so an imported TEXTUAL-CONVENTION changing its range
+                regenerates every module that imports it while a comment
+                touched anywhere regenerates nothing. Defaults to
+                :py:class:`~pysmi.cache.null.NullBuildCache` -- product
+                caching is opt-in, unlike parse caching;
+                :py:class:`~pysmi.cache.memory.InMemoryBuildCache` covers a
+                one-process build and
+                :py:class:`~pysmi.cache.file.FileBuildCache` one that spans
+                processes. Only a module that was generated and written
+                without error is ever cached, so a failure is never served
+                back as a success.
         """
         self._parser = parser
         self._codegen = codegen
@@ -357,6 +378,29 @@ class MibCompiler:
         self._parseCache: AbstractParseCache = (
             InMemoryParseCache() if parseCache is None else parseCache
         )
+        #: Where compiled products are kept between :py:meth:`compile`
+        #: calls. Off unless the caller opted in.
+        self._buildCache: AbstractBuildCache = (
+            NullBuildCache() if buildCache is None else buildCache
+        )
+        #: Identifies what would do the rendering, so a cached product is
+        #: never offered back as the output of a different generator or a
+        #: different pysmi release. Same reasoning as ``_parserId`` above:
+        #: a product is this generator's output at this version, not a
+        #: versioned interchange format. A generator-specific knob that
+        #: changes the output without changing the class -- the JSON schema
+        #: version -- is folded in where the generator declares one.
+        self._codegenId = "/".join(
+            (
+                packageVersion,
+                f"{type(codegen).__module__}.{type(codegen).__qualname__}",
+                str(getattr(type(codegen), "SCHEMA_VERSION", "")),
+            )
+        )
+        #: Semantic digest of each source seen, keyed by its full digest.
+        #: Lexing for the semantic digest is skipped for any text seen
+        #: before, which is every unchanged module of a repeated build.
+        self._semanticDigests: dict[str, str] = {}
         #: Identifies what would do the parsing, so a cached tree is never
         #: offered to a different producer. Only a cache outliving this
         #: process can encounter that, and one of those is exactly what
@@ -476,6 +520,22 @@ class MibCompiler:
 
         return self
 
+    def clear_build_cache(self) -> "MibCompiler":
+        """Drop every compiled product the configured cache holds.
+
+        Never needed for correctness -- a key is derived from everything
+        that can change the product, so an entry is only ever reused for
+        input that would regenerate it byte for byte. It is here for a
+        caller that wants the space back at a known point.
+
+        Returns:
+            reference to itself (can be used for call chaining)
+
+        """
+        self._buildCache.clear()
+
+        return self
+
     def _parse_cache_key(self, digest: str) -> str:
         """The cache key for text with the given digest.
 
@@ -511,6 +571,102 @@ class MibCompiler:
             self._parseCache.set(key, cached)
 
         return copy.deepcopy(cached)
+
+    def _semantic_digest(self, digest: str, data: str) -> str:
+        """The semantic digest of *data*, memoised on its full digest.
+
+        The memo is what keeps a repeated build cheap: an unchanged module
+        is recognised by its full digest and never lexed again, while the
+        one edit in a large source set is lexed exactly once.
+        """
+        semantic = self._semanticDigests.get(digest)
+
+        if semantic is None:
+            semantic = semantic_digest(data)
+            self._semanticDigests[digest] = semantic
+
+        return semantic
+
+    @staticmethod
+    def _dependency_closure(
+        mibname: str, importsByMib: dict[str, tuple[str, ...]]
+    ) -> set[str]:
+        """Every module *mibname* imports, directly or transitively.
+
+        The walk is a fixpoint over the import edges, so a cycle neither
+        hangs nor is treated specially: modules that import each other
+        simply share one closure, and a change to any member of a cycle
+        invalidates every member. That is the deterministic answer to
+        circular imports -- a cycle is one invalidation unit.
+        """
+        closure: set[str] = set()
+        stack = [mibname]
+
+        while stack:
+            for imported in importsByMib.get(stack.pop(), ()):
+                if imported not in closure:
+                    closure.add(imported)
+                    stack.append(imported)
+
+        return closure
+
+    def _build_cache_key(
+        self,
+        fileInfo: MibInfo,
+        mibname: str,
+        options: dict[str, Any],
+        semanticDigests: dict[str, str],
+        importsByMib: dict[str, tuple[str, ...]],
+    ) -> str | None:
+        """The cache key for rendering *mibname* from *fileInfo*, or ``None``.
+
+        Everything that can change the rendered module is folded in:
+
+        * the generator's identity and the pysmi version, so a generator
+          upgrade never reads a previous release's products;
+        * the generation options that shape the output (``genTexts``,
+          ``repairImports``);
+        * the path the selected copy was read from, so a source-priority
+          change that selects a different copy -- even an identical one --
+          regenerates rather than serving the other source's provenance;
+        * the module's semantic digest: what the lexer hands the parser,
+          with comments and layout already discarded. Comments never reach
+          the parse tree, so the rule for a comment-only change is uniform
+          across output modes -- it is a hit. What ``genTexts`` carries
+          into the output are DESCRIPTION strings, which are tokens, not
+          comments, and are covered by the digest;
+        * the semantic digest of every imported module, transitively, so a
+          TEXTUAL-CONVENTION changing its range in an imported module
+          regenerates this one though its own text is untouched.
+
+        ``None`` means uncacheable: a ``textFilter`` callable has no stable
+        identity to key on, and an import that was never parsed has no
+        digest to fold in. Either regenerates every time, which is always
+        safe.
+        """
+        if options.get("textFilter") is not None:
+            return None
+
+        closure = self._dependency_closure(mibname, importsByMib)
+
+        if any(imported not in semanticDigests for imported in closure):
+            return None
+
+        material = "\n".join(
+            (
+                self._codegenId,
+                "texts" if options.get("genTexts") else "no-texts",
+                "repair" if options.get("repairImports", True) else "no-repair",
+                fileInfo.path,
+                semanticDigests[mibname],
+                *(
+                    f"{imported}={semanticDigests[imported]}"
+                    for imported in sorted(closure)
+                ),
+            )
+        )
+
+        return sha256(material.encode()).hexdigest()
 
     def add_priority_sources(self, *sources: "AbstractReader") -> "MibCompiler":
         """Add ASN.1 MIB source repositories to be asked ahead of the rest.
@@ -858,12 +1014,21 @@ class MibCompiler:
         failedMibs: dict[str, Any] = {}
         borrowedMibs: dict[str, Any] = {}
         builtMibs: dict[str, Any] = {}
+        pendingProducts: dict[str, Any] = {}
         symbolTableMap: dict[str, Any] = {}
         mibsToParse = list(mibnames)
         canonicalMibNames: dict[str, Any] = {}
         shadowedMibs: dict[str, list[str]] = {}
         precedenceOfMib: dict[str, str] = {}
         usedPathOfMib: dict[str, str] = {}
+        #: Semantic digest (comments stripped) of every module parsed in
+        #: this call, keyed by module name. Feeds the build-cache keys.
+        semanticDigests: dict[str, str] = {}
+        #: Direct imports of every module parsed in this call.
+        importsByMib: dict[str, tuple[str, ...]] = {}
+        #: Whether any of that is computed at all: with the null provider
+        #: there is no key to derive, and the lexing it costs is wasted.
+        buildCacheActive = not isinstance(self._buildCache, NullBuildCache)
 
         while mibsToParse:
             mibname = mibsToParse.pop(0)
@@ -932,6 +1097,12 @@ class MibCompiler:
                         symbolTableMap[mibInfo.name] = symbolTable
 
                         parsedMibs[mibInfo.name] = fileInfo, mibInfo, mibTree
+
+                        if buildCacheActive:
+                            semanticDigests[mibInfo.name] = self._semantic_digest(
+                                fileInfo.digest, fileData
+                            )
+                            importsByMib[mibInfo.name] = tuple(mibInfo.imported)
 
                         failedMibs.pop(mibname, None)
 
@@ -1125,6 +1296,38 @@ class MibCompiler:
                 f"Produced by {packageName}-{packageVersion}",
             ]
 
+            cacheKey = (
+                self._build_cache_key(
+                    fileInfo, mibname, options, semanticDigests, importsByMib
+                )
+                if buildCacheActive
+                else None
+            )
+
+            if cacheKey is not None:
+                cachedProduct = self._buildCache.get(cacheKey)
+
+                if cachedProduct is not None:
+                    # A copy is handed on rather than the cached MibInfo
+                    # itself: what happens to the product from here -- the
+                    # writer, the status record -- must not reach the copy
+                    # the cache holds.
+                    cachedInfo, cachedData = cachedProduct
+                    builtMibs[mibname] = (
+                        fileInfo,
+                        copy.deepcopy(cachedInfo),
+                        cachedData,
+                    )
+                    del parsedMibs[mibname]
+
+                    logger.debug(
+                        "%s served from the build cache",
+                        mibname,
+                        extra={"mib": mibname},
+                    )
+
+                    continue
+
             try:
                 mibInfo, mibData = self._codegen.gen_code(
                     mibTree,
@@ -1136,6 +1339,14 @@ class MibCompiler:
 
                 builtMibs[mibname] = fileInfo, mibInfo, mibData
                 del parsedMibs[mibname]
+
+                # Not published yet: a module whose import fails further
+                # down is dropped from builtMibs before it is written, and
+                # only a module that is written may be cached -- a failure
+                # must never be served back as a success. The store loop
+                # publishes.
+                if cacheKey is not None:
+                    pendingProducts[mibname] = cacheKey, mibInfo, mibData
 
                 logger.debug(
                     "%s read from %s and compiled by %s",
@@ -1385,6 +1596,16 @@ class MibCompiler:
                     self._writer.put_data(
                         mibname, mibData, dryRun=bool(options.get("dryRun"))
                     )
+
+                # Only now is the product publishable: generation succeeded
+                # and no import of this module failed (those modules were
+                # dropped from builtMibs above). A module that was served
+                # from the cache has no pending entry and is not re-stored.
+                pending = pendingProducts.pop(mibname, None)
+
+                if pending is not None:
+                    cacheKey, pendingInfo, pendingData = pending
+                    self._buildCache.set(cacheKey, (pendingInfo, pendingData))
 
                 logger.debug(
                     "%s stored by %s",
