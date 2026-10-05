@@ -187,6 +187,15 @@ class PySmiSemanticError(PySmiCodegenError):
     """
 
 
+class PySmiPruneError(PySmiCodegenError):
+    """A symbol-scope build could not be restricted to its target symbols.
+
+    Raised when a named target symbol does not exist in the module, or when a
+    symbol that has to be carried alongside a target cannot be resolved to
+    either a definition the module keeps or an import the module can load.
+    """
+
+
 class PySmiPatchError(PySmiError):
     """A MIB patch is not a well-formed unified diff.
 

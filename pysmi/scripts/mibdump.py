@@ -139,6 +139,7 @@ def _compile_to(
     keepTextsLayout = options["keepTextsLayout"]
     doFuzzyMatchingFlag = options["doFuzzyMatchingFlag"]
     nodepsFlag = options["nodepsFlag"]
+    targetSymbols = options["targetSymbols"]
     rebuildFlag = options["rebuildFlag"]
     pruneFlag = options["pruneFlag"]
     bundledMibsFlag = options["bundledMibsFlag"]
@@ -348,6 +349,7 @@ def _compile_to(
         processed = mibCompiler.compile(
             *inputMibs,
             noDeps=nodepsFlag,
+            targetSymbols=targetSymbols or None,
             rebuild=rebuildFlag,
             dryRun=dryrunFlag,
             genTexts=genMibTextsFlag,
@@ -531,6 +533,7 @@ def start() -> None:
     emitSpecs: list[str] = []
     cacheDirectory = ""
     nodepsFlag = False
+    targetSymbols: dict[str, list[str]] = {}
     rebuildFlag = False
     buildAllFlag = False
     pruneFlag = False
@@ -563,6 +566,7 @@ def start() -> None:
         [--cache-directory=<DIRECTORY>]
         [--disable-fuzzy-source]
         [--no-dependencies]
+        [--target-symbol=<MODULE-NAME>:<SYMBOL>]
         [--no-bundled-mibs]
         [--prefer-mib-source]
         [--no-base-mibs]
@@ -643,6 +647,17 @@ def start() -> None:
                 all. --no-bundled-mibs is: it drops the bundle as a
                 source, so a base MIB the replacement list leaves
                 unstubbed has to come from --mib-source or it is missing.
+        --target-symbol=<MODULE-NAME>:<SYMBOL> - restrict each named module
+                to a compact build carrying only the target symbols and what
+                loading them requires: OID ancestors, referenced types, table
+                rows with their index columns, AUGMENTS rows, and the imports
+                the kept symbols need. Repeatable, and several symbols may
+                target one module. A notification or object group named as a
+                target expands to the closure of the objects it references.
+                A missing target or an unresolvable dependency fails the
+                module rather than silently producing a partial one. This is
+                symbol-level pruning: referred modules are reduced the same
+                way instead of being copied back wholesale.
         --strict-imports - fail a MIB that uses an SNMPv2-SMI, SNMPv2-TC or
                 SNMPv2-CONF symbol without naming it in IMPORTS, which RFC
                 2578 Section 3.2 does not allow. Without this the import is
@@ -677,6 +692,7 @@ def start() -> None:
                 "emit=",
                 "cache-directory=",
                 "no-dependencies",
+                "target-symbol=",
                 "no-bundled-mibs",
                 "prefer-mib-source",
                 "no-base-mibs",
@@ -757,6 +773,18 @@ def start() -> None:
 
         if opt[0] == "--no-dependencies":
             nodepsFlag = True
+
+        if opt[0] == "--target-symbol":
+            module, sep, symbol = opt[1].partition(":")
+
+            if not sep or not module or not symbol:
+                sys.stderr.write(
+                    "ERROR: --target-symbol takes MODULE-NAME:SYMBOL, e.g. "
+                    f"IF-MIB:ifDescr\r\n{helpMessage}\r\n"
+                )
+                sys.exit(EX_USAGE)
+
+            targetSymbols.setdefault(module, []).append(symbol)
 
         if opt[0] == "--no-bundled-mibs":
             bundledMibsFlag = False
@@ -907,6 +935,7 @@ def start() -> None:
         "keepTextsLayout": keepTextsLayout,
         "doFuzzyMatchingFlag": doFuzzyMatchingFlag,
         "nodepsFlag": nodepsFlag,
+        "targetSymbols": targetSymbols or None,
         "rebuildFlag": rebuildFlag,
         "pruneFlag": pruneFlag,
         "bundledMibsFlag": bundledMibsFlag,

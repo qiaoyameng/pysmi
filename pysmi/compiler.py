@@ -31,6 +31,7 @@ from pysmi.borrower.base import AbstractBorrower
 from pysmi.cache.base import AbstractParseCache
 from pysmi.cache.memory import InMemoryParseCache
 from pysmi.codegen.base import REPAIRED_IMPORTS_KEY, AbstractCodeGen
+from pysmi.codegen.pruner import prune_modules
 from pysmi.codegen.symtable import SymtableCodeGen
 from pysmi.mibinfo import (
     MibInfo,
@@ -174,6 +175,14 @@ class MibStatus(str):
     #: their content differed from the one used. Empty in the usual case that
     #: only one configured source had the module.
     shadowed: tuple[str, ...]
+    #: Symbols kept in the output by a symbol-scope build, when
+    #: ``targetSymbols`` restricted the compile. Unset for a full compile.
+    keptSymbols: tuple[str, ...]
+    #: Why each kept symbol was kept: the targets themselves and every symbol
+    #: pulled in as their dependency, keyed by Python-safe symbol name.
+    keepReasons: dict[str, str]
+    #: Why each retained import was needed, keyed by the imported symbol.
+    importReasons: dict[str, str]
     #: Which rule picked the copy that was used, one of the ``PRECEDENCE_*``
     #: constants. Set only when something was ``shadowed``, since with one
     #: copy there was nothing to decide.
@@ -810,6 +819,19 @@ class MibCompiler:
             strictSources: fail a MIB that more than one configured source
                 has a different copy of, rather than taking one and
                 reporting the other on ``MibStatus.shadowed``.
+            targetSymbols: build a compact artifact restricted to the named
+                target symbols. A mapping of module name to the raw symbol
+                names to keep in it. Each module is reduced to those targets
+                and their symbol-level closure: OID ancestors, referenced
+                types, table rows and index columns, AUGMENTS rows, the
+                objects a notification or group references, and exactly the
+                imports the kept symbols load. A referred module that is also
+                being compiled is reduced the same way instead of being copied
+                back whole. A target a module does not define, or a dependency
+                that cannot be resolved, fails the module. Without this the
+                full module is generated. The symbols kept and the reason for
+                each are reported on ``MibStatus.keptSymbols``,
+                ``MibStatus.keepReasons`` and ``MibStatus.importReasons``.
 
         Returns:
             A dictionary of MIB module names processed (keys) and *MibStatus*
@@ -1104,6 +1126,79 @@ class MibCompiler:
             len(failedMibs),
             extra={"parsed": len(parsedMibs), "failed": len(failedMibs)},
         )
+
+        #
+        # Optionally reduce every parsed module to the symbol-level closure
+        # of the named target symbols. Module-level dependency tracking is
+        # deliberately not enough: a referred vendor module is reduced to the
+        # symbols the reference reaches rather than copied wholesale.
+        #
+
+        targetSymbols = options.get("targetSymbols")
+        pruneAnnotations: dict[str, dict[str, Any]] = {}
+
+        if targetSymbols:
+            try:
+                generated = frozenset(parsedMibs)
+                asts = {
+                    mibname: parsedMibs[mibname][2] for mibname in parsedMibs
+                }
+
+                new_asts, new_tables, keep_reasons, import_reasons = (
+                    prune_modules(
+                        asts,
+                        symbolTableMap,
+                        dict(targetSymbols),
+                        generated_modules=generated,
+                    )
+                )
+
+            except error.PySmiError as exc:
+                # Symbol-level pruning is one closure across modules, so an
+                # unresolved target or dependency invalidates the whole
+                # restricted build: rendering any module from it could carry a
+                # dangling reference. The originating error survives on the
+                # module it names; the others carry the same message.
+                for mibname in parsedMibs.copy():
+                    if getattr(exc, "mibname", None) == mibname:
+                        failed = exc
+                    else:
+                        failed = error.PySmiPruneError(str(exc))
+                        failed.mibname = mibname
+                    processed[mibname] = statusFailed.set_options(error=failed)
+                    failedMibs[mibname] = failed
+                    del parsedMibs[mibname]
+
+            else:
+                for mibname, new_tree in new_asts.items():
+                    fileInfo, mibInfo, _old_tree = parsedMibs[mibname]
+                    parsedMibs[mibname] = fileInfo, mibInfo, new_tree
+                    symbolTableMap[mibname] = new_tables[mibname]
+
+                for mibname, symbols in keep_reasons.items():
+                    logger.info(
+                        "pruned %s to %d symbols for targets %s",
+                        mibname,
+                        len(symbols),
+                        ", ".join(targetSymbols.get(mibname, ())) or "<via reference>",
+                        extra={
+                            "mib": mibname,
+                            "kept_symbols": len(symbols),
+                            "keep_reasons": dict(symbols),
+                            "import_reasons": dict(import_reasons.get(mibname, {})),
+                        },
+                    )
+                    pruneAnnotations[mibname] = {
+                        "keptSymbols": tuple(sorted(symbols)),
+                        "keepReasons": dict(symbols),
+                        "importReasons": dict(import_reasons.get(mibname, {})),
+                    }
+
+                # A parsed module the closure kept nothing in is not rendered.
+                for mibname in tuple(parsedMibs):
+                    if mibname not in new_asts:
+                        del parsedMibs[mibname]
+                        processed.setdefault(mibname, statusUntouched)
 
         #
         # Generate code for parsed MIBs
@@ -1412,6 +1507,7 @@ class MibCompiler:
                         ),
                         shadowed=tuple(shadowedMibs.get(mibname, ())),
                         precedence=precedenceOfMib.get(mibname, ""),
+                        **pruneAnnotations.get(mibname, {}),
                     )
 
             except error.PySmiError as exc:

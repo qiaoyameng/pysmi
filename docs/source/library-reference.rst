@@ -40,6 +40,47 @@ This example showcases some of its features:
 
    print(status)
 
+.. _symbol-scoped-builds:
+
+Building only the symbols you deploy
+------------------------------------
+
+An agent that polls a handful of OIDs does not need every symbol of every
+vendor MIB generated into its output. Passing ``targetSymbols`` to
+:py:meth:`~pysmi.compiler.MibCompiler.compile` restricts each named module to
+the symbols given and to the *symbol-level* closure that lets them load:
+
+* every OID ancestor a kept symbol hangs its OID off;
+* every type a kept object or textual convention derives from;
+* the table, its row, the row's index columns, and the columns a kept target
+  needs;
+* rows related through an ``AUGMENTS`` clause, in both directions;
+* the objects a kept notification carries, and everything a kept object group
+  or notification group references;
+* the groups and objects a kept ``MODULE-COMPLIANCE`` names;
+* exactly the imports the kept symbols need to load.
+
+This is a symbol closure rather than a module dependency: when a referred
+vendor module is itself being compiled, it is reduced to the symbols the
+reference reaches instead of being copied back wholesale.
+
+.. code-block:: python
+
+   status = mibCompiler.compile(
+       "IF-MIB",
+       targetSymbols={"IF-MIB": ["ifDescr", "ifOperStatus"]},
+   )
+
+   # the symbols kept, and why each one was kept
+   print(status["IF-MIB"].keptSymbols)
+   print(status["IF-MIB"].keepReasons)
+
+A target symbol a module does not define, or a dependency that cannot be
+resolved to a kept symbol or an import, fails that module rather than
+producing a partial artifact. The same selection is available from the
+command line as ``mibdump --target-symbol=IF-MIB:ifDescr``, repeated as
+needed.
+
 .. toctree::
    :maxdepth: 2
 
@@ -303,4 +344,3 @@ them out individually:
 
    ``debug.setLogger()`` and ``debug.Debug()`` still work, but are
    deprecated in favour of ``debug.enableDebugLogging()``.
-

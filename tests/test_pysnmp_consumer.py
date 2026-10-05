@@ -31,6 +31,16 @@ import unittest
 import pytest
 
 from hatch_build import build as build_precompiled
+from pysmi.codegen.pysnmp import PySnmpCodeGen as _PrunePySnmpCodeGen
+from pysmi.codegen.pruner import prune_modules as _prune_modules
+from tests.test_symbol_prune import (
+    DEP_MIB as _PRUNE_DEP_MIB,
+    DEP_MODULE as _PRUNE_DEP_MODULE,
+    MAIN_MIB as _PRUNE_MAIN_MIB,
+    MODULE as _PRUNE_MODULE,
+    _build_tables as _prune_build_tables,
+)
+
 from hatch_build import patch_asn1
 from pysmi.codegen import PySnmpCodeGen
 from pysmi.codegen.pysnmp_surface import (
@@ -756,6 +766,105 @@ def _serving(directory):
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=5)
+
+
+
+class SymbolPruneParityTestCase(unittest.TestCase):
+    """Pruned output means the same as full output for the target objects."""
+
+    def _load(self, asts, tables, modules, targets=None):
+        """Load *modules* into one builder, pruning first when *targets*."""
+        from pysnmp.smi.builder import MibBuilder
+
+        if targets is not None:
+            pruned_asts, pruned_tables, _r, _i = _prune_modules(
+                asts,
+                tables,
+                targets,
+                generated_modules=frozenset({_PRUNE_MODULE, _PRUNE_DEP_MODULE}),
+            )
+            merged = dict(tables)
+            merged.update(pruned_tables)
+        else:
+            pruned_asts, merged = asts, tables
+
+        builder = MibBuilder()
+        builder.loadTexts = False
+        for name in modules:
+            source = _PrunePySnmpCodeGen().gen_code(pruned_asts[name], merged, genTexts=False)[1]
+            context = {"mibBuilder": builder}
+            exec(compile(source, name, "exec"), context, context)
+
+        return builder
+
+    def _pair(self, targets, modules=(_PRUNE_MODULE, _PRUNE_DEP_MODULE)):
+        asts, tables = _prune_build_tables(_PRUNE_MAIN_MIB, _PRUNE_DEP_MIB)
+        full = self._load(asts, tables, modules)
+        pruned = self._load(asts, tables, modules, targets=targets)
+        return full, pruned
+
+    def test_target_oids_match(self):
+        full, pruned = self._pair(
+            {_PRUNE_MODULE: ["pmName", "pmEvent", "pmScalar"]}, modules=(_PRUNE_MODULE,)
+        )
+        for symbol in ("pmName", "pmEvent", "pmScalar"):
+            self.assertEqual(
+                full.importSymbols(_PRUNE_MODULE, symbol)[0].getName(),
+                pruned.importSymbols(_PRUNE_MODULE, symbol)[0].getName(),
+                symbol,
+            )
+
+    def test_size_constraint_matches(self):
+        full, pruned = self._pair({_PRUNE_MODULE: ["pmName"]}, modules=(_PRUNE_MODULE,))
+
+        from pyasn1.error import PyAsn1Error
+
+        for builder in (full, pruned):
+            column = builder.importSymbols(_PRUNE_MODULE, "pmName")[0]
+            with self.assertRaises(PyAsn1Error):
+                column.getSyntax().clone(b"x" * 40)
+            self.assertEqual(bytes(column.getSyntax().clone(b"x" * 8)), b"x" * 8)
+
+    def test_index_encoding_matches(self):
+        full, pruned = self._pair({_PRUNE_MODULE: ["pmName"]}, modules=(_PRUNE_MODULE,))
+
+        self.assertEqual(
+            full.importSymbols(_PRUNE_MODULE, "pmEntry")[0].getIndexNames(),
+            pruned.importSymbols(_PRUNE_MODULE, "pmEntry")[0].getIndexNames(),
+        )
+        self.assertEqual(
+            tuple(full.importSymbols(_PRUNE_MODULE, "pmEntry")[0].getInstIdFromIndices(7)),
+            tuple(
+                pruned.importSymbols(_PRUNE_MODULE, "pmEntry")[0].getInstIdFromIndices(7)
+            ),
+        )
+
+    def test_augmented_index_adopted(self):
+        full, pruned = self._pair({_PRUNE_MODULE: ["pmAuxData"]}, modules=(_PRUNE_MODULE,))
+        self.assertEqual(
+            full.importSymbols(_PRUNE_MODULE, "pmAuxEntry")[0].getIndexNames(),
+            pruned.importSymbols(_PRUNE_MODULE, "pmAuxEntry")[0].getIndexNames(),
+        )
+
+    def test_notification_objects_preserved(self):
+        full, pruned = self._pair({_PRUNE_MODULE: ["pmEvent"]}, modules=(_PRUNE_MODULE,))
+        self.assertEqual(
+            [str(o[0]) for o in full.importSymbols(_PRUNE_MODULE, "pmEvent")[0].getObjects()],
+            [
+                str(o[0])
+                for o in pruned.importSymbols(_PRUNE_MODULE, "pmEvent")[0].getObjects()
+            ],
+        )
+
+    def test_cross_module_oid_matches(self):
+        full, pruned = self._pair({_PRUNE_DEP_MODULE: ["pdRef"]})
+        self.assertEqual(
+            full.importSymbols(_PRUNE_DEP_MODULE, "pdRef")[0].getName(),
+            pruned.importSymbols(_PRUNE_DEP_MODULE, "pdRef")[0].getName(),
+        )
+        for gone in ("pmScalar", "pmCount", "pmEvent"):
+            with self.assertRaises(Exception):
+                pruned.importSymbols(_PRUNE_MODULE, gone)
 
 
 suite = unittest.TestLoader().loadTestsFromModule(sys.modules[__name__])
